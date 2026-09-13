@@ -39,6 +39,10 @@ aiclipper = ["templates/*.html", "templates/*.css", "data/*.json"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+  "needs_ffmpeg: test shells out to ffmpeg",
+  "slow: takes more than a few seconds",
+]
 
 [tool.ruff]
 line-length = 110
