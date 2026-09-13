@@ -1,0 +1,44 @@
+<!-- aiclipper forum story card template, driven from Python via window.__forumRender. -->
+<!--STYLE-->
+<div id="stage">
+  <div id="card">
+    <div id="meta">
+      <div id="badge"></div>
+      <div>
+        <div id="community"></div>
+        <div id="author"></div>
+      </div>
+    </div>
+    <div id="title"></div>
+    <div id="body"></div>
+    <div id="row">
+      <div class="chip"><span class="arrow"></span><span id="votes"></span></div>
+      <div class="chip"><span class="speech"></span><span id="comments"></span></div>
+    </div>
+  </div>
+</div>
+<script>
+  (function () {
+    function trim(text, limit) {
+      var value = String(text || "").trim();
+      if (value.length <= limit) { return value; }
+      return value.slice(0, limit).replace(/[\s.,;:]+$/, "") + "…";
+    }
+
+    window.__forumRender = function (data) {
+      data = data || {};
+      document.body.setAttribute("data-theme", data.theme || "dark");
+      document.getElementById("badge").textContent = data.badge || "";
+      document.getElementById("community").textContent = data.community || "";
+      document.getElementById("author").textContent = data.author || "";
+      document.getElementById("title").textContent = data.title || "";
+      var body = document.getElementById("body");
+      var excerpt = trim(data.body, 320);
+      body.textContent = excerpt;
+      body.className = excerpt ? "" : "empty";
+      document.getElementById("votes").textContent = data.upvotes || "0";
+      document.getElementById("comments").textContent = data.comments || "0";
+      return document.getElementById("card").getBoundingClientRect().height;
+    };
+  })();
+</script>

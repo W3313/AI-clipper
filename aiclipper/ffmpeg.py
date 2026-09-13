@@ -10,8 +10,9 @@ import json
 import logging
 import shutil
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 from .config import Settings, get_settings
 from .models import MediaInfo

@@ -1,0 +1,215 @@
+"""The ElevenLabs backend: REST over :mod:`urllib.request`, no SDK.
+
+One POST to ``/v1/text-to-speech/{voice_id}`` with ``xi-api-key`` returns mp3
+bytes.  That is the entire integration, so there is no reason to take a
+dependency for it -- the standard library is enough and the module stays
+importable everywhere.
+
+The API gives no word boundaries, so ``TTSResult.words`` is ``None`` and callers
+that need caption timings force-align with :func:`aiclipper.transcribe.align`.
+``VoiceSpec.rate`` has no API equivalent either; it is applied during the mp3
+transcode as an ``atempo`` filter so the setting still means something.
+
+:func:`build_request` is deliberately separate from the call that sends it: the
+request shape is then testable with no network at all.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+from .. import ffmpeg
+from ..config import Settings
+from ..errors import TTSError
+from ..models import TTSResult, VoiceSpec
+from .base import _settings as _resolve_settings
+from .voices import resolve_voice_id
+
+log = logging.getLogger(__name__)
+
+__all__ = [
+    "ElevenLabsTTS", "API_ROOT", "DEFAULT_MODEL", "DEFAULT_VOICE_ID",
+    "build_request", "tempo_filters",
+]
+
+#: Documented endpoint root.
+API_ROOT = "https://api.elevenlabs.io/v1/text-to-speech"
+
+#: Multilingual model; overridable per call.
+DEFAULT_MODEL = "eleven_multilingual_v2"
+
+#: "Adam", one of the public sample voices, used when nothing else resolves.
+DEFAULT_VOICE_ID = "pNInz6obpgDQGcFmaJgB"
+
+#: Network timeout for one synthesis request, in seconds.
+DEFAULT_TIMEOUT = 60.0
+
+#: ``atempo`` only accepts 0.5..2.0 per instance, so larger changes chain.
+_ATEMPO_MIN = 0.5
+_ATEMPO_MAX = 2.0
+
+
+def build_request(
+    text: str,
+    voice_id: str,
+    api_key: str,
+    *,
+    model: str = DEFAULT_MODEL,
+    stability: float = 0.5,
+    similarity_boost: float = 0.75,
+    style: float = 0.0,
+) -> urllib.request.Request:
+    """Build the POST for one synthesis, without sending it.
+
+    Pure and network-free, which is what makes the request shape testable in an
+    offline CI.
+    """
+    if not (text or "").strip():
+        raise TTSError("elevenlabs cannot synthesise empty text")
+    if not voice_id:
+        raise TTSError("elevenlabs needs a voice id")
+    if not api_key:
+        raise TTSError("ELEVENLABS_API_KEY is not set")
+
+    payload = {
+        "text": text,
+        "model_id": model,
+        "voice_settings": {
+            "stability": float(stability),
+            "similarity_boost": float(similarity_boost),
+            "style": float(style),
+        },
+    }
+    return urllib.request.Request(
+        f"{API_ROOT}/{voice_id}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "xi-api-key": api_key,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg",
+        },
+        method="POST",
+    )
+
+
+def tempo_filters(rate: float) -> list[str]:
+    """``atempo`` chain implementing a playback-rate multiplier.
+
+    ``atempo`` is limited to 0.5..2.0 per instance, so 3x becomes
+    ``atempo=2.0,atempo=1.5``.  Returns ``[]`` for a rate of 1.
+    """
+    try:
+        value = float(rate)
+    except (TypeError, ValueError):
+        return []
+    if value <= 0 or abs(value - 1.0) < 1e-3:
+        return []
+    value = max(0.25, min(4.0, value))
+    chain: list[str] = []
+    while value > _ATEMPO_MAX:
+        chain.append(f"atempo={_ATEMPO_MAX:g}")
+        value /= _ATEMPO_MAX
+    while value < _ATEMPO_MIN:
+        chain.append(f"atempo={_ATEMPO_MIN:g}")
+        value /= _ATEMPO_MIN
+    if abs(value - 1.0) >= 1e-3:
+        chain.append(f"atempo={value:.4f}")
+    return chain
+
+
+class ElevenLabsTTS:
+    """Speech via the ElevenLabs REST API."""
+
+    name = "elevenlabs"
+
+    def __init__(self, *, settings: Settings | None = None, model: str = DEFAULT_MODEL) -> None:
+        self.settings = _resolve_settings(settings)
+        self.model = model
+
+    def available(self) -> bool:
+        """A key is set, ffmpeg is present, and we are not running offline."""
+        if self.settings.offline:
+            return False
+        return bool(self.settings.elevenlabs_api_key) and ffmpeg.have_ffmpeg(self.settings)
+
+    def voice_id(self, voice: VoiceSpec | None) -> str:
+        """Native ElevenLabs voice id for ``voice``."""
+        return resolve_voice_id(voice, "elevenlabs", default=DEFAULT_VOICE_ID) or DEFAULT_VOICE_ID
+
+    def _fetch(self, text: str, voice: VoiceSpec) -> bytes:
+        if self.settings.offline:
+            raise TTSError(
+                "elevenlabs needs network access but settings.offline is set; "
+                "use the 'offline' provider or unset AICLIP_OFFLINE"
+            )
+        key = self.settings.elevenlabs_api_key
+        if not key:
+            raise TTSError("ELEVENLABS_API_KEY is not set; export it or pick another tts provider")
+
+        request = build_request(text, self.voice_id(voice), key, model=self.model)
+        try:
+            with urllib.request.urlopen(request, timeout=DEFAULT_TIMEOUT) as response:
+                status = getattr(response, "status", 200) or 200
+                body: bytes = response.read()
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = _decode(exc.read() if hasattr(exc, "read") else b"")
+            finally:
+                # HTTPError *is* the response object; leaving it open leaks a socket.
+                with contextlib.suppress(Exception):
+                    exc.close()
+            raise TTSError(f"elevenlabs returned HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise TTSError(f"elevenlabs request failed: {exc.reason}") from exc
+        except (TimeoutError, OSError) as exc:
+            # A read timeout surfaces as a bare socket error, not a URLError.
+            raise TTSError(f"elevenlabs request failed: {exc}") from exc
+
+        if status != 200:
+            raise TTSError(f"elevenlabs returned HTTP {status}: {_decode(body)}")
+        if not body:
+            raise TTSError("elevenlabs returned an empty response body")
+        return body
+
+    def synthesize(self, text: str, out_path: Path, *, voice: VoiceSpec) -> TTSResult:
+        """Speak ``text`` into ``out_path``.  ``words`` is always ``None``."""
+        if not (text or "").strip():
+            raise TTSError("elevenlabs cannot synthesise empty text")
+        spec = voice or VoiceSpec()
+        out = Path(out_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        audio = self._fetch(text, spec)
+        with tempfile.TemporaryDirectory(prefix="aiclip-eleven-") as tmp:
+            mp3 = Path(tmp) / "speech.mp3"
+            mp3.write_bytes(audio)
+            args: list[str] = ["-y", "-i", str(mp3), "-vn", "-ac", "1", "-ar", "44100"]
+            chain = tempo_filters(spec.rate)
+            if chain:
+                args += ["-af", ",".join(chain)]
+            args += [str(out)]
+            ffmpeg.run_ffmpeg(args, settings=self.settings)
+
+        return TTSResult(
+            audio_path=out,
+            duration=ffmpeg.probe(out, settings=self.settings).duration,
+            words=None,
+            voice=spec,
+            text=text,
+        )
+
+
+def _decode(body: Any) -> str:
+    if isinstance(body, bytes):
+        text = body.decode("utf-8", "replace")
+    else:
+        text = str(body or "")
+    text = text.strip()
+    return text[:800] if text else "<empty body>"

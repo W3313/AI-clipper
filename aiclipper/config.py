@@ -103,7 +103,7 @@ class Settings:
     def elevenlabs_api_key(self) -> str:
         return os.environ.get("ELEVENLABS_API_KEY", "").strip()
 
-    def ensure_dirs(self) -> "Settings":
+    def ensure_dirs(self) -> Settings:
         for path in (self.work_dir, self.output_dir, self.cache_dir, self.backgrounds_dir, self.music_dir):
             path.mkdir(parents=True, exist_ok=True)
         return self

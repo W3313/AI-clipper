@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Literal, Sequence
+from typing import Any, Literal
 
 __all__ = [
     "Word", "Segment", "Transcript",
@@ -67,7 +68,7 @@ class Word:
     def duration(self) -> float:
         return max(0.0, self.end - self.start)
 
-    def shifted(self, offset: float) -> "Word":
+    def shifted(self, offset: float) -> Word:
         return Word(self.text, self.start + offset, self.end + offset, self.prob)
 
 
@@ -84,7 +85,7 @@ class Segment:
     def duration(self) -> float:
         return max(0.0, self.end - self.start)
 
-    def shifted(self, offset: float) -> "Segment":
+    def shifted(self, offset: float) -> Segment:
         return Segment(
             self.text,
             self.start + offset,
@@ -124,7 +125,7 @@ class Transcript:
         return not any(s.text.strip() for s in self.segments)
 
     # -- operations -------------------------------------------------------- #
-    def slice(self, start: float, end: float, rebase: bool = True) -> "Transcript":
+    def slice(self, start: float, end: float, rebase: bool = True) -> Transcript:
         """Return the portion overlapping ``[start, end)``.
 
         With ``rebase`` the result is shifted so ``start`` becomes ``0.0`` --
@@ -163,7 +164,7 @@ class Transcript:
         return to_jsonable(self)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Transcript":
+    def from_dict(cls, data: dict[str, Any]) -> Transcript:
         segs = [
             Segment(
                 text=s.get("text", ""),
@@ -185,11 +186,11 @@ class Transcript:
         return p
 
     @classmethod
-    def load(cls, path: str | Path) -> "Transcript":
+    def load(cls, path: str | Path) -> Transcript:
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
     @classmethod
-    def from_words(cls, words: Sequence[Word], language: str = "en", max_gap: float = 0.6) -> "Transcript":
+    def from_words(cls, words: Sequence[Word], language: str = "en", max_gap: float = 0.6) -> Transcript:
         """Group a flat word list into segments, splitting on pauses/punctuation."""
         segs: list[Segment] = []
         cur: list[Word] = []
@@ -251,14 +252,14 @@ class ClipCandidate:
     def duration(self) -> float:
         return max(0.0, self.end - self.start)
 
-    def padded(self, before: float, after: float, limit: float | None = None) -> "ClipCandidate":
+    def padded(self, before: float, after: float, limit: float | None = None) -> ClipCandidate:
         start = max(0.0, self.start - before)
         end = self.end + after
         if limit is not None:
             end = min(end, limit)
         return ClipCandidate(start, end, self.title, self.hook, self.reason, self.score, list(self.tags))
 
-    def overlaps(self, other: "ClipCandidate", tolerance: float = 0.0) -> bool:
+    def overlaps(self, other: ClipCandidate, tolerance: float = 0.0) -> bool:
         return self.start < other.end - tolerance and other.start < self.end - tolerance
 
 
@@ -362,7 +363,7 @@ class VoiceSpec:
     language: str = "en"
 
     @classmethod
-    def parse(cls, spec: str) -> "VoiceSpec":
+    def parse(cls, spec: str) -> VoiceSpec:
         """``"edge:en-US-GuyNeural"`` / ``"narrator_male"`` / ``""``."""
         spec = (spec or "").strip()
         if not spec:
@@ -432,7 +433,7 @@ class CropPath:
         if t >= kfs[-1].t:
             k = kfs[-1]
             return CropKeyframe(t, k.x, k.y, k.w, k.h)
-        for a, b in zip(kfs, kfs[1:]):
+        for a, b in zip(kfs, kfs[1:], strict=False):  # pairwise: last keyframe has no successor
             if a.t <= t <= b.t:
                 span = (b.t - a.t) or 1e-6
                 f = _clamp((t - a.t) / span, 0.0, 1.0)
@@ -447,7 +448,7 @@ class CropPath:
         return CropKeyframe(t, k.x, k.y, k.w, k.h)
 
     @classmethod
-    def static(cls, x: int, y: int, w: int, h: int, source_width: int, source_height: int) -> "CropPath":
+    def static(cls, x: int, y: int, w: int, h: int, source_width: int, source_height: int) -> CropPath:
         return cls([CropKeyframe(0.0, x, y, w, h)], source_width, source_height)
 
 

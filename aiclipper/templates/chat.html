@@ -1,0 +1,58 @@
+<!-- aiclipper chat overlay template: driven from Python via window.__chatInit /
+     window.__chatState so the browser is launched once for N states. -->
+<!--STYLE-->
+<div id="head">
+  <div id="avatar"></div>
+  <div id="contact"></div>
+</div>
+<div id="feed-wrap">
+  <div id="feed"></div>
+</div>
+<script>
+  (function () {
+    var DATA = { contact: "", initials: "", theme: "classic", messages: [] };
+
+    function el(tag, cls, text) {
+      var node = document.createElement(tag);
+      if (cls) { node.className = cls; }
+      if (text !== undefined && text !== null) { node.textContent = String(text); }
+      return node;
+    }
+
+    function bubbleRow(msg) {
+      var row = el("div", msg.outgoing ? "row out" : "row");
+      if (msg.label) { row.appendChild(el("div", "label", msg.label)); }
+      row.appendChild(el("div", "bubble", msg.text || ""));
+      return row;
+    }
+
+    function typingRow(outgoing) {
+      var row = el("div", outgoing ? "row out" : "row");
+      var bubble = el("div", "bubble typing");
+      for (var i = 0; i < 3; i += 1) { bubble.appendChild(el("span", "dot")); }
+      row.appendChild(bubble);
+      return row;
+    }
+
+    window.__chatInit = function (data) {
+      DATA = data || DATA;
+      document.body.setAttribute("data-theme", DATA.theme || "classic");
+      document.getElementById("avatar").textContent = DATA.initials || "";
+      document.getElementById("contact").textContent = DATA.contact || "";
+      var head = document.getElementById("head");
+      head.style.display = (DATA.contact || "").trim() ? "block" : "none";
+      window.__chatState({ visible: 0, typing: false, outgoing: false });
+      return true;
+    };
+
+    window.__chatState = function (state) {
+      var feed = document.getElementById("feed");
+      feed.textContent = "";
+      var visible = Math.max(0, Math.min(DATA.messages.length, state.visible || 0));
+      for (var i = 0; i < visible; i += 1) { feed.appendChild(bubbleRow(DATA.messages[i])); }
+      if (state.typing) { feed.appendChild(typingRow(!!state.outgoing)); }
+      // force layout so the screenshot never races the DOM update
+      return feed.getBoundingClientRect().height;
+    };
+  })();
+</script>
