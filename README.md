@@ -81,6 +81,54 @@ print(result.output, result.duration)
 Each pipeline returns a `ProjectResult` carrying the output path, the duration and
 metadata about how it was made. The `clip` pipeline returns one per short.
 
+## Run it fully locally
+
+Nothing here has to touch a cloud service. The three model-backed stages each
+have a local backend, and the rest of the engine -- reframing, captions, chat and
+card graphics, all rendering -- is local already.
+
+**Transcription** is local out of the box. It uses faster-whisper, which
+downloads its weights once and then runs offline on CPU or GPU:
+
+```bash
+export AICLIP_WHISPER_MODEL=base        # tiny | base | small | medium | large-v3
+export AICLIP_WHISPER_DEVICE=cuda       # or cpu (the default)
+```
+
+**Scripts and clip selection** can run on a self-hosted model through any
+OpenAI-compatible endpoint, which covers Ollama, llama.cpp's server, LM Studio
+and vLLM:
+
+```bash
+ollama pull llama3.1
+export AICLIP_LLM=local
+export AICLIP_LLM_BASE_URL=http://localhost:11434/v1
+export AICLIP_LLM_LOCAL_MODEL=llama3.1
+```
+
+Smaller models are less reliable at strict JSON than a frontier model, so the
+local backend asks for schema-guided output, validates what comes back, makes one
+repair attempt, and falls through to the rule-based writer rather than letting a
+rambling reply kill a render.
+
+**Narration** can run on Piper, a small CPU-fast neural voice:
+
+```bash
+# install piper and drop a voice .onnx into assets/piper/
+export AICLIP_TTS=piper
+export AICLIP_PIPER_VOICE=en_US-lessac-medium
+```
+
+Then confirm the whole local stack in one command:
+
+```bash
+aiclip doctor
+```
+
+It reports each backend as installed, usable, or missing, and a local endpoint
+that is configured but not answering shows up there rather than halfway through a
+render.
+
 ## It runs with nothing configured
 
 There is a complete offline path: a rule-based script writer, a speech synthesiser

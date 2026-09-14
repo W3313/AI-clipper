@@ -32,6 +32,13 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(_env(name) or default)
+    except ValueError:
+        return default
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(_env(name) or default)
@@ -66,12 +73,22 @@ class Settings:
     # -- language model ---------------------------------------------------- #
     llm_provider: str = field(default_factory=lambda: _env("AICLIP_LLM", "auto"))
     llm_model: str = field(default_factory=lambda: _env("AICLIP_LLM_MODEL", "claude-opus-5"))
+    #: OpenAI-compatible endpoint for a locally hosted model.  Ollama, llama.cpp's
+    #: server, LM Studio and vLLM all speak this protocol, so one client reaches
+    #: every one of them.  Include the version prefix, e.g. ".../v1".
+    llm_base_url: str = field(default_factory=lambda: _env("AICLIP_LLM_BASE_URL", "http://localhost:11434/v1"))
+    llm_local_model: str = field(default_factory=lambda: _env("AICLIP_LLM_LOCAL_MODEL", "llama3.1"))
+    llm_timeout: float = field(default_factory=lambda: _env_float("AICLIP_LLM_TIMEOUT", 120.0))
     llm_effort: str = field(default_factory=lambda: _env("AICLIP_LLM_EFFORT", "medium"))
     llm_max_tokens: int = field(default_factory=lambda: _env_int("AICLIP_LLM_MAX_TOKENS", 16000))
 
     # -- speech synthesis -------------------------------------------------- #
     tts_provider: str = field(default_factory=lambda: _env("AICLIP_TTS", "auto"))
     tts_voice: str = field(default_factory=lambda: _env("AICLIP_VOICE", ""))
+    #: Local neural speech.  ``piper_binary`` is resolved on PATH unless given an
+    #: absolute path; ``piper_voice_dir`` holds the downloaded .onnx voices.
+    piper_binary: str = field(default_factory=lambda: _env("AICLIP_PIPER", "piper"))
+    piper_voice: str = field(default_factory=lambda: _env("AICLIP_PIPER_VOICE", ""))
 
     # -- behaviour --------------------------------------------------------- #
     offline: bool = field(default_factory=lambda: _env_bool("AICLIP_OFFLINE", False))
@@ -94,6 +111,23 @@ class Settings:
     @property
     def cache_dir(self) -> Path:
         return self.work_dir / "cache"
+
+    @property
+    def piper_voice_dir(self) -> Path:
+        return _env_path("AICLIP_PIPER_VOICES", self.assets_dir / "piper")
+
+    @property
+    def llm_api_key(self) -> str:
+        """Token for the OpenAI-compatible endpoint.
+
+        Local servers usually need none; a placeholder is sent so that clients
+        which insist on an Authorization header still work.
+        """
+        for var in ("AICLIP_LLM_API_KEY", "OPENAI_API_KEY"):
+            value = os.environ.get(var, "").strip()
+            if value:
+                return value
+        return ""
 
     @property
     def anthropic_api_key(self) -> str:

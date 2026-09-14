@@ -61,6 +61,23 @@ the seam it would attach to. Everything upstream produces a `Timeline`, and the
 renderer consumes nothing else, so a UI that edits a `Timeline` and re-renders is
 a self-contained project rather than a rewrite.
 
+## Running without a cloud provider
+
+Every model-backed stage has a local backend, so the engine can run end to end on
+one machine with no account anywhere:
+
+| Stage | Local backend | Notes |
+|---|---|---|
+| Transcription | faster-whisper | local from the start; downloads weights once |
+| Scripts, clip selection | any OpenAI-compatible endpoint | Ollama, llama.cpp, LM Studio, vLLM |
+| Narration | Piper | small, CPU-fast, permissively licensed |
+| Reframing, captions, overlays, rendering | OpenCV, ffmpeg, Pillow | no model involved |
+
+The local language backend is deliberately defensive: it asks for schema-guided
+output, validates the reply, makes one repair attempt, and falls through to the
+rule-based writer instead of failing a render. Small models ramble, and a video
+pipeline should survive that.
+
 ## What runs without anything
 
 The engine has an offline path end to end: a rule-based language provider that
