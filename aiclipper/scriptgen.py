@@ -178,6 +178,16 @@ def _looks_like_instruction(text: str) -> bool:
     return any(marker in low for marker in _INSTRUCTION_MARKERS)
 
 
+def _model_title(raw: Any) -> str:
+    """A model-supplied title, or ``""`` when it is our own prompt echoed back.
+
+    Titles get the same guard as hooks, beats and messages because a title is
+    not merely displayed -- it names the output file.
+    """
+    title = " ".join(str(raw or "").split())
+    return "" if _looks_like_instruction(title) else title
+
+
 def _words(text: str) -> list[str]:
     return _WORD_RE.findall(text or "")
 
@@ -566,9 +576,26 @@ def _prompt_bundle(job: str, topic: str, **kwargs: Any) -> tuple[str, dict[str, 
         from .llm import prompts as P
 
         builder = {"script": P.script_prompt, "chat": P.chat_prompt, "forum": P.forum_prompt}[job]
-        return builder(topic, **kwargs), P.get_schema(job), P.get_system(job)
+        prompt, schema, system = builder(topic, **kwargs), P.get_schema(job), P.get_system(job)
     except Exception:
-        return _fallback_prompt(job, topic, **kwargs), _FALLBACK_SCHEMAS[job], ""
+        prompt, schema, system = _fallback_prompt(job, topic, **kwargs), _FALLBACK_SCHEMAS[job], ""
+    return _tag_subject(prompt, topic), schema, system
+
+
+def _tag_subject(prompt: str, topic: str) -> str:
+    """Mark which part of ``prompt`` is the subject rather than our instructions.
+
+    The offline provider builds its content out of the tagged section alone, so
+    a two-word topic can no longer be out-voted by the boilerplate around it.
+    Any provider that does not know the marker just reads a labelled restatement
+    of the topic, and if the llm layer is unavailable the prompt is unchanged.
+    """
+    try:
+        from .llm.heuristic import with_subject
+
+        return with_subject(prompt, topic)
+    except Exception:
+        return prompt
 
 
 def _resolve_provider(provider: Any, settings: Settings) -> Any:
@@ -663,7 +690,7 @@ def _script_from_data(data: dict[str, Any]) -> VideoScript | None:
             hashtags.append(normalized)
 
     script = VideoScript(
-        title=str(data.get("title") or "").strip(),
+        title=_model_title(data.get("title")),
         hook=hook,
         beats=beats,
         cta=str(data.get("cta") or "").strip(),
@@ -701,7 +728,9 @@ def _finish_copy(script: VideoScript, topic: str) -> None:
     """Fill in title, call to action and hashtags -- the spoken parts, pre-budget."""
     keyword = _keyword(topic)
     if not script.title:
-        script.title = _titlecase(script.hook or topic) or "Untitled Short"
+        # The topic first: a rejected or missing title must still name the video
+        # after what it is about, and the hook may itself be generated filler.
+        script.title = _titlecase(topic) or _titlecase(script.hook) or "Untitled Short"
     if not script.cta:
         script.cta = f"Follow for more on {keyword}."
     if not script.hashtags:
@@ -773,7 +802,7 @@ def _chat_from_data(data: dict[str, Any]) -> ChatScript | None:
     if not contact:
         contact = next((m.sender for m in messages if not m.outgoing and m.sender != "Unknown"), "")
     return ChatScript(
-        title=str(data.get("title") or "").strip(),
+        title=_model_title(data.get("title")),
         contact=contact or "Unknown",
         messages=messages,
     )
@@ -917,7 +946,7 @@ def write_reddit(
 
 
 def _post_from_data(data: dict[str, Any]) -> RedditPost | None:
-    title = str(data.get("title") or "").strip()
+    title = _model_title(data.get("title"))
     body = str(data.get("body") or "").strip()
     if not body or _count_words(body) < 10:
         return None

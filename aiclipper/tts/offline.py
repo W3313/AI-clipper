@@ -159,6 +159,19 @@ class OfflineTTS:
         """True whenever ffmpeg is installed -- there is nothing else to check."""
         return ffmpeg.have_ffmpeg(self.settings)
 
+    def usable(self, *, timeout: float | None = None, refresh: bool = False) -> bool:
+        """The capability probe, which for this backend is the availability check.
+
+        There is no service to reach and no key to validate, so "could it
+        speak?" collapses to "is ffmpeg here?" -- which is why this backend is
+        the floor of :func:`aiclipper.tts.base.fallback_chain`.  ``timeout`` is
+        accepted for interface symmetry and never needed.  See
+        :func:`aiclipper.tts.base.provider_usable` for the distinction this
+        method draws elsewhere.
+        """
+        del timeout, refresh  # nothing to bound and nothing worth caching
+        return self.available()
+
     def synthesize(self, text: str, out_path: Path, *, voice: VoiceSpec) -> TTSResult:
         """Write a silent wav of the right length and describe its word timings.
 

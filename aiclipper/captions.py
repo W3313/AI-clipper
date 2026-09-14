@@ -31,6 +31,7 @@ __all__ = [
     "DEFAULT_STYLE",
     "GAP_SPLIT",
     "HOLD_SECONDS",
+    "ABBREVIATIONS",
     "group_words",
     "write_ass",
     "build",
@@ -50,7 +51,9 @@ DEFAULT_STYLE = "clean"
 #: A silence longer than this (seconds) always starts a new cue.
 GAP_SPLIT = 0.7
 
-#: How long a cue may linger past its last word when there is room for it.
+#: How long a cue lingers past its last word when the next cue is far away (or
+#: there is no next cue).  Inside a continuous run of speech a cue instead holds
+#: until the next one starts, so the caption track never has a sub-frame hole.
 HOLD_SECONDS = 0.30
 
 #: Smallest cue/dialogue duration we are willing to emit.
@@ -61,10 +64,39 @@ FADE_MS = 120
 POP_MS = 120
 MOVE_MS = 140
 
+#: A cue whose widest *single word* would run off the canvas is emitted at a
+#: smaller font size, because no ``WrapStyle`` breaks inside a word: libass
+#: simply lets it spill past both edges.  The shrink stops here (pixels in
+#: reference units, i.e. on a 1920-tall canvas) -- below this the caption is
+#: unreadable anyway, and a clipped word is the lesser evil.  It is low enough
+#: that every preset absorbs a word of ~80 characters before giving up.
+MIN_FIT_SIZE = 28
+
 _ALIGNMENT = {"top": 8, "center": 5, "bottom": 2}
 _SENTENCE_END = (".", "!", "?", "\u2026")
+
+#: Punctuation that ends a clause.  A line that has to be cut mid-sentence is
+#: cut here in preference to an arbitrary ``max_chars`` boundary.
+_CLAUSE_END = (",", ";", ":", "\u2013", "\u2014")
+
 _TRAILING_PUNCT = "\"')]}\u00bb\u201d\u2019\u203a"
-_INITIAL_RE = re.compile(r"^[A-Za-z]\.$")
+
+#: Initials and dotted acronyms: ``J.``, ``U.S.``, ``e.g.``, ``a.m.``.
+_DOTTED_RE = re.compile(r"^(?:[A-Za-z]\.)+$")
+
+#: A short bare number followed by a dot -- a list marker (``3.``) or the head
+#: of a decimal -- rather than the end of a thought.
+_NUMBER_RE = re.compile(r"^\d{1,3}\.$")
+
+#: Words whose trailing dot is part of the abbreviation, not a full stop.
+ABBREVIATIONS = frozenset(
+    """
+    mr mrs ms mx dr prof rev hon capt sgt lt col gen gov sen rep pres jr sr
+    st mt ave blvd rd vs etc inc ltd llc co corp dept univ approx fig
+    jan feb mar apr jun jul aug sep sept oct nov dec
+    mon tue tues wed thu thurs fri sat sun
+    """.split()
+)
 _STYLE_FORMAT = (
     "Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
     "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, "
@@ -301,47 +333,111 @@ def get_style(name: str | CaptionStyle) -> CaptionStyle:
 # grouping
 # --------------------------------------------------------------------------- #
 
+def _strip_edges(text: str) -> str:
+    """``text`` without surrounding whitespace or closing quotes/brackets."""
+    return text.strip().rstrip(_TRAILING_PUNCT)
+
+
 def _ends_sentence(text: str) -> bool:
-    stripped = text.strip().rstrip(_TRAILING_PUNCT)
+    """True when ``text`` is the final word of a sentence.
+
+    ``!``, ``?`` and ``...`` are unambiguous.  A trailing full stop is not: it
+    also appears in initials and dotted acronyms (``J.``, ``U.S.``, ``e.g.``),
+    in common abbreviations (``Mr.``, ``Inc.``) and on short bare numbers, which
+    are list markers or the head of a decimal (``3.`` of ``3.5``) far more often
+    than they are the end of a thought.  Those keep the group running.
+    """
+    stripped = _strip_edges(text)
     if not stripped or not stripped.endswith(_SENTENCE_END):
         return False
-    return not _INITIAL_RE.match(stripped)
+    if not stripped.endswith("."):
+        return True
+    if _DOTTED_RE.match(stripped) or _NUMBER_RE.match(stripped):
+        return False
+    return stripped[:-1].lower() not in ABBREVIATIONS
 
 
-def group_words(words: Sequence[Word], style: CaptionStyle) -> list[CaptionCue]:
+def _ends_clause(text: str) -> bool:
+    """True when ``text`` carries comma/semicolon/colon/dash punctuation."""
+    return _strip_edges(text).endswith(_CLAUSE_END)
+
+
+def _line_length(group: Sequence[Word]) -> int:
+    """Rendered width of ``group`` in characters, single-spaced."""
+    return len(" ".join(w.text.strip() for w in group))
+
+
+def _clause_cut(group: Sequence[Word], incoming: str, max_words: int, max_chars: int) -> int | None:
+    """How many words of a full ``group`` to keep so the cut lands on a clause.
+
+    Returns ``None`` when the plain cut (everything stays, ``incoming`` opens the
+    next cue) is already the best option: the line ends on clause punctuation
+    anyway, there is no clause boundary late enough in it to be worth using, or
+    moving the tail across would immediately overflow the next cue.
+    """
+    count = len(group)
+    if count < 2 or _ends_clause(group[-1].text):
+        return None
+    keep_min = max(1, (count + 1) // 2)
+    for cut in range(count - 1, keep_min - 1, -1):
+        if not _ends_clause(group[cut - 1].text):
+            continue
+        tail = group[cut:]
+        if len(tail) + 1 > max_words:
+            continue
+        if _line_length(tail) + 1 + len(incoming) > max_chars:
+            continue
+        return cut
+    return None
+
+
+def group_words(
+    words: Sequence[Word],
+    style: CaptionStyle,
+    *,
+    hold: float = HOLD_SECONDS,
+    gap_split: float = GAP_SPLIT,
+) -> list[CaptionCue]:
     """Pack ``words`` into on-screen cues according to ``style``.
 
     Words are never dropped (except blank ones) nor reordered.  A new cue starts
-    when the previous one is full (``max_words`` / ``max_chars``), when the pause
-    before the next word exceeds :data:`GAP_SPLIT`, or right after a
-    sentence-final word.  Each cue lingers up to :data:`HOLD_SECONDS` past its
-    last word but never into the next cue.
+    when the pause before the next word exceeds ``gap_split``, right after a
+    sentence-final word (see :func:`_ends_sentence`), or when the line is full
+    (``max_words`` / ``max_chars``) -- and a full line is cut on clause
+    punctuation rather than mid-phrase whenever one is available.
+
+    Timing: inside a continuous run of speech every cue is held until the next
+    one starts, so the burned-in track has no sub-frame holes that would flash a
+    blank frame mid-sentence.  Where the speech itself pauses -- a gap wider than
+    ``gap_split``, or the end of the track -- the cue lingers ``hold`` seconds
+    and the screen then clears rather than sitting over silence.
     """
     max_words = max(1, int(style.max_words))
     max_chars = max(1, int(style.max_chars))
+    hold_for = max(0.0, float(hold))
+    gap_limit = max(0.0, float(gap_split))
 
     groups: list[list[Word]] = []
     current: list[Word] = []
-    current_chars = 0
 
     for word in words:
         text = word.text.strip()
         if not text:
             continue
         if current:
-            gap = word.start - current[-1].end
-            would_be = current_chars + 1 + len(text)
-            if (
-                gap > GAP_SPLIT
-                or len(current) >= max_words
-                or would_be > max_chars
-                or _ends_sentence(current[-1].text)
-            ):
+            gap = float(word.start) - float(current[-1].end)
+            if gap > gap_limit or _ends_sentence(current[-1].text):
                 groups.append(current)
                 current = []
-                current_chars = 0
+            elif len(current) >= max_words or _line_length(current) + 1 + len(text) > max_chars:
+                cut = _clause_cut(current, text, max_words, max_chars)
+                if cut is None:
+                    groups.append(current)
+                    current = []
+                else:
+                    groups.append(current[:cut])
+                    current = current[cut:]
         current.append(word)
-        current_chars = len(text) if len(current) == 1 else current_chars + 1 + len(text)
     if current:
         groups.append(current)
 
@@ -351,13 +447,16 @@ def group_words(words: Sequence[Word], style: CaptionStyle) -> list[CaptionCue]:
         end = max(float(group[-1].end), start + MIN_CUE)
         next_start = float(groups[index + 1][0].start) if index + 1 < len(groups) else None
         if next_start is None:
-            end += HOLD_SECONDS
+            end += hold_for
+        elif next_start <= end:
+            # Out-of-order / overlapping input: give way to the next cue.
+            end = min(end, max(start, next_start))
+        elif next_start - end <= gap_limit:
+            # Continuous speech: hand over exactly, leaving no empty frame.
+            end = next_start
         else:
-            room = next_start - end
-            if room > 0:
-                end += min(HOLD_SECONDS, room * 0.5)
-            else:
-                end = min(end, max(start, next_start))
+            # A real pause in the speech -- linger a little, then clear.
+            end = min(end + hold_for, next_start)
         # Out-of-order / overlapping input can collapse the window above; never
         # emit a cue that would be on screen for zero seconds.
         if end <= start:
@@ -378,6 +477,116 @@ def _tokens(cue: CaptionCue, style: CaptionStyle) -> list[str]:
             continue
         out.append(escape_text(text.upper() if style.uppercase else text))
     return out
+
+
+#: Where a TrueType face for a caption font might live.  Same places the overlay
+#: renderer looks; kept local so :mod:`aiclipper.captions` stays importable with
+#: nothing but the standard library plus Pillow.
+_FONT_DIRS = (
+    "/usr/share/fonts/truetype/dejavu",
+    "/usr/share/fonts/truetype/liberation",
+    "/usr/share/fonts/truetype/freefont",
+    "/usr/share/fonts/TTF",
+    "/usr/share/fonts",
+    "/usr/local/share/fonts",
+    "/Library/Fonts",
+    "/System/Library/Fonts",
+    "C:/Windows/Fonts",
+)
+
+_font_cache: dict[tuple[str, bool, int], object | None] = {}
+
+
+def _measuring_font(style: CaptionStyle) -> object | None:
+    """A Pillow font matching ``style`` at its own size, or ``None``.
+
+    Used only to *measure* -- libass does the drawing.  Every failure path
+    (no Pillow, no matching face, an unreadable file) returns ``None``, and the
+    caller then behaves exactly as it did before any measuring existed.
+    """
+    key = (style.font, bool(style.bold), int(style.font_size))
+    if key in _font_cache:
+        return _font_cache[key]
+
+    font: object | None = None
+    try:
+        from PIL import ImageFont
+    except Exception:  # pragma: no cover - Pillow is a base dependency
+        _font_cache[key] = None
+        return None
+
+    from .config import get_settings
+
+    stem = "".join(style.font.split())
+    names = [f"{stem}-Bold.ttf", f"{stem}-Bold.otf"] if style.bold else []
+    names += [f"{stem}.ttf", f"{stem}.otf", f"{stem}-Regular.ttf"]
+    names += ["DejaVuSans-Bold.ttf"] if style.bold else []
+    names += ["DejaVuSans.ttf"]
+
+    roots: list[Path] = []
+    try:
+        roots.append(get_settings().fonts_dir)
+    except Exception:  # pragma: no cover - settings should always resolve
+        pass
+    roots += [Path(d) for d in _FONT_DIRS]
+
+    for root in roots:
+        try:
+            if not root.is_dir():
+                continue
+        except OSError:  # pragma: no cover - unreadable mount
+            continue
+        for name in names:
+            for candidate in (root / name, *sorted(root.glob(f"*/{name}")), *sorted(root.glob(f"*/*/{name}"))):
+                if not candidate.is_file():
+                    continue
+                try:
+                    font = ImageFont.truetype(str(candidate), max(1, int(style.font_size)))
+                except OSError:  # pragma: no cover - a corrupt face on the box
+                    continue
+                _font_cache[key] = font
+                return font
+    _font_cache[key] = None
+    return None
+
+
+def _fit_font_size(words: Sequence[str], style: CaptionStyle, width: int, *, grow: float = 1.0) -> int | None:
+    """Font size that keeps the widest word inside the margins, or ``None``.
+
+    ``None`` means "leave the style alone": the words already fit, or the face
+    could not be measured.  ASS wraps between words only -- no ``WrapStyle``
+    breaks *inside* one -- so a word wider than the text column is drawn past
+    both canvas edges unless the whole cue is set smaller.
+
+    ``grow`` is the largest factor an animation stretches a single word by (the
+    ``pop`` scale); the word is measured at that peak, because that is when it
+    is widest on screen.
+
+    The trigger is the **canvas**, not the margins: a word that spills into the
+    side margin is merely tight, and every preset is tuned around its own
+    margins, so nothing is resized until a word would actually leave the frame.
+    Once it would, the cue is shrunk all the way back into the text column.
+    """
+    if not words:
+        return None
+    column = int(width) - 2 * int(style.margin_h)
+    pad = 2 * int(round(style.outline))
+    factor = max(1.0, float(grow))
+    font = _measuring_font(style)
+    if font is None:
+        return None
+    try:
+        widest = max(float(font.getlength(word)) for word in words)  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover - exotic faces without metrics
+        return None
+    if widest <= 0 or widest * factor + pad <= int(width):
+        return None
+    target = column - pad
+    if target <= 0:
+        return None
+    floor = min(MIN_FIT_SIZE, int(style.font_size))
+    size = max(floor, int(style.font_size * target / (widest * factor)))
+    return size if size < int(style.font_size) else None
 
 
 def _anchor(style: CaptionStyle, width: int, height: int) -> tuple[int, int]:
@@ -488,13 +697,20 @@ def _cue_dialogues(cue: CaptionCue, style: CaptionStyle, width: int, height: int
     base_color = ass_color(style.primary_color, with_alpha=False)
     high_color = ass_color(style.highlight_color, with_alpha=False)
     plain = " ".join(tokens)
+    # A word too wide for the text column is drawn off both edges, so the whole
+    # cue drops to a size that fits.  ``\fs`` is untouched by every animation
+    # override below (``\fscx`` is a *percentage* of it, so the pop still pops).
+    display = [w.text.strip().upper() if style.uppercase else w.text.strip() for w in cue.words]
+    grow = float(style.scale_pop) if animation == "pop" else 1.0
+    fitted = _fit_font_size([w for w in display if w], style, width, grow=grow)
+    fit = f"{{\\fs{fitted}}}" if fitted else ""
 
     if animation == "karaoke":
         lines = []
         for i, (start, end) in enumerate(_word_spans(cue, len(tokens))):
             parts = list(tokens)
             parts[i] = f"{{\\c{high_color}}}{tokens[i]}{{\\c{base_color}}}"
-            lines.append(_dialogue(start, end, " ".join(parts)))
+            lines.append(_dialogue(start, end, fit + " ".join(parts)))
         return lines
 
     if animation == "pop":
@@ -504,25 +720,25 @@ def _cue_dialogues(cue: CaptionCue, style: CaptionStyle, width: int, height: int
             parts = list(tokens)
             grow = f"{{\\fscx100\\fscy100\\t(0,{POP_MS},\\fscx{scale}\\fscy{scale})}}"
             parts[i] = f"{grow}{tokens[i]}{{\\fscx100\\fscy100}}"
-            lines.append(_dialogue(start, end, " ".join(parts)))
+            lines.append(_dialogue(start, end, fit + " ".join(parts)))
         return lines
 
     if animation == "typewriter":
         lines = []
         for i, (start, end) in enumerate(_word_spans(cue, len(tokens))):
-            lines.append(_dialogue(start, end, " ".join(tokens[: i + 1])))
+            lines.append(_dialogue(start, end, fit + " ".join(tokens[: i + 1])))
         return lines
 
     if animation == "bounce":
         x, y = _anchor(style, width, height)
         drop = max(6, int(round(style.font_size * 0.35)))
         move = f"{{\\move({x},{y + drop},{x},{y},0,{MOVE_MS})}}"
-        return [_dialogue(cue.start, cue.end, f"{move}{plain}")]
+        return [_dialogue(cue.start, cue.end, f"{fit}{move}{plain}")]
 
     if animation == "fade":
-        return [_dialogue(cue.start, cue.end, f"{{\\fad({FADE_MS},{FADE_MS})}}{plain}")]
+        return [_dialogue(cue.start, cue.end, f"{fit}{{\\fad({FADE_MS},{FADE_MS})}}{plain}")]
 
-    return [_dialogue(cue.start, cue.end, plain)]
+    return [_dialogue(cue.start, cue.end, fit + plain)]
 
 
 def write_ass(
@@ -553,8 +769,13 @@ def build(
     style: str | CaptionStyle = DEFAULT_STYLE,
     width: int = 1080,
     height: int = 1920,
+    hold: float = HOLD_SECONDS,
+    gap_split: float = GAP_SPLIT,
 ) -> Path:
-    """Group ``words``, render them with ``style`` and write the ASS file."""
+    """Group ``words``, render them with ``style`` and write the ASS file.
+
+    ``hold`` and ``gap_split`` are passed straight to :func:`group_words`.
+    """
     resolved = get_style(style)
-    cues = group_words(words, resolved)
+    cues = group_words(words, resolved, hold=hold, gap_split=gap_split)
     return write_ass(cues, out_path, style=resolved, width=width, height=height)

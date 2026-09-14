@@ -38,13 +38,14 @@ from .. import ffmpeg
 from ..config import Settings
 from ..errors import MissingDependency, TTSError
 from ..models import TTSResult, VoiceSpec, Word
+from . import base
 from .base import _settings as _resolve_settings
 from .voices import resolve_voice_id
 
 log = logging.getLogger(__name__)
 
 __all__ = [
-    "EdgeTTS", "DEFAULT_EDGE_VOICE", "TICKS_PER_SECOND",
+    "EdgeTTS", "DEFAULT_EDGE_VOICE", "TICKS_PER_SECOND", "PROBE_TEXT",
     "format_rate", "format_pitch", "ticks_to_seconds", "words_from_boundaries",
     "run_async", "edge_available",
 ]
@@ -62,6 +63,10 @@ TICKS_PER_SECOND = 10_000_000
 #: offset.  One semitone comes out near 12 Hz, which is the right order of
 #: magnitude for speech without being so coarse it sounds robotic.
 PITCH_REFERENCE_HZ = 200.0
+
+#: One syllable, spoken by the capability probe when the library is too old to
+#: expose ``list_voices``.  Short enough that the probe costs nothing.
+PROBE_TEXT = "hi"
 
 #: The service rejects extreme prosody; clamp rather than 400 out.
 _RATE_LIMITS = (0.5, 2.0)
@@ -183,10 +188,65 @@ class EdgeTTS:
         self.settings = _resolve_settings(settings)
 
     def available(self) -> bool:
-        """``edge_tts`` importable, ffmpeg present, and not running offline."""
+        """``edge_tts`` importable, ffmpeg present, and not running offline.
+
+        An import check, deliberately: it is consulted on every render and must
+        not touch the network.  It says nothing about whether the *service* can
+        be reached -- that is :meth:`usable`.
+        """
         if self.settings.offline:
             return False
         return edge_available() and ffmpeg.have_ffmpeg(self.settings)
+
+    def usable(self, *, timeout: float | None = None, refresh: bool = False) -> bool:
+        """Can this machine actually reach the speech service?
+
+        :meth:`available` answers "is the package installed?", which on a boxed-in
+        network is an ``OK`` that turns into a dead render -- exactly the kind of
+        lie a diagnostic must not tell.  This one asks the service: a voice-list
+        fetch (or, on a library too old to offer one, a two-letter synthesis),
+        bounded to ``timeout`` seconds (default
+        :data:`aiclipper.tts.base.USABLE_TIMEOUT`) both inside the event loop and
+        by the thread that runs it, so a hung TLS handshake returns ``False``
+        instead of wedging the caller.
+
+        The verdict is cached for the process -- keyed by the timeout, because a
+        stricter bound is a different question -- so probing costs one round trip
+        however many times it is asked.  ``refresh=True`` probes again.
+        """
+        if not self.available():
+            return False
+        limit = float(timeout) if timeout and timeout > 0 else float(base.USABLE_TIMEOUT)
+        key = f"edge:{limit:g}"
+        return base.cached_usable(key, lambda: self._probe(limit), refresh=refresh)
+
+    def _probe(self, timeout: float) -> bool:
+        """One round trip to the service, or ``False`` if it does not answer."""
+        edge_tts = self._require()
+        list_voices = getattr(edge_tts, "list_voices", None)
+
+        async def _ask() -> bool:
+            if callable(list_voices):
+                result = list_voices()
+                if inspect.isawaitable(result):
+                    result = await asyncio.wait_for(result, timeout)
+                return bool(result)
+            # Older builds expose no listing endpoint; the cheapest honest probe
+            # is then the smallest possible synthesis.
+            communicate = self._communicate(edge_tts, PROBE_TEXT, VoiceSpec())
+
+            async def _first_chunk() -> bool:
+                async for chunk in communicate.stream():
+                    if chunk.get("type") == "audio" and chunk.get("data"):
+                        return True
+                return False
+
+            return await asyncio.wait_for(_first_chunk(), timeout)
+
+        # The wait_for above bounds the awaits; run_bounded bounds everything
+        # else -- a blocking DNS lookup or TLS handshake inside the library never
+        # yields to the loop, so the timeout has to exist outside it too.
+        return base.run_bounded(lambda: bool(run_async(_ask)), timeout + 0.5, default=False)
 
     # -- internals --------------------------------------------------------- #
     def _require(self) -> Any:

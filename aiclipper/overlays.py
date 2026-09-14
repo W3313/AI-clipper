@@ -15,12 +15,35 @@ Both backends emit exactly the same number of images, in the same order, at
 exactly the requested canvas size, so a pipeline can switch backends without
 re-timing anything.
 
+**One theme, one definition.**  Every colour, radius, spacing and font size
+lives exactly once, in :data:`THEMES` (i.e. in :data:`CHAT_THEMES` and
+:data:`FORUM_THEMES`), as unitless fractions of the canvas or of the base font
+size.  :func:`_chat_metrics` / :func:`_forum_metrics` turn a theme plus a
+canvas size into concrete pixels, and *both* backends consume that one result:
+Pillow draws with it directly, and the Chromium backend injects it into the
+page as CSS custom properties before screenshotting.  The stylesheets therefore
+contain no palette and no magic numbers -- if they did, "silently falls back to
+pillow" would silently change how the video looks.
+
 ``render_chat`` turns a :class:`~aiclipper.models.ChatScript` into one
 transparent PNG per *conversation state*: image ``i`` shows messages ``0..i``.
 A message with ``typing > 0`` additionally gets a state just before it that
-shows a typing indicator on that message's side of the screen.  The newest
+shows a typing indicator on that message's side of the screen.  With
+``header_state=True`` an extra leading state is emitted that shows the chrome
+(avatar + contact name) with no bubbles at all, so a caller can hold something
+on screen from ``t=0`` instead of opening on a bare background.  The newest
 bubble is anchored low in the safe area and older bubbles scroll up (the
 topmost fading out) once the stack overflows -- text size never shrinks.
+
+Fonts are resolved from ``settings.fonts_dir`` and the usual system directories;
+a **colour** emoji font (``NotoColorEmoji``, ``Apple Color Emoji``,
+``seguiemj``) is preferred over a monochrome one when the machine has one.
+Known limitation: Chromium falls back per glyph, so it picks the colour font up
+automatically, but Pillow/FreeType has no per-glyph font fallback -- it draws
+every character from the single face it was handed.  On a machine whose text
+font only carries outline emoji (DejaVu Sans does), the Pillow backend will
+therefore still draw emoji as monochrome outlines.  Installing a colour emoji
+font does not change that for Pillow; only the Chromium backend benefits.
 
 All artwork here is original: generic bubbles, a generic card, our own
 palettes.  Nothing imitates the trade dress of any real product.
@@ -53,6 +76,7 @@ __all__ = [
     "ForumTheme",
     "CHAT_THEMES",
     "FORUM_THEMES",
+    "THEMES",
     "TEMPLATE_DIR",
     "BACKENDS",
     "chat_states",
@@ -96,7 +120,14 @@ class ChatState:
 
 @dataclass(frozen=True)
 class ChatTheme:
-    """Colour palette for the chat overlay (original design)."""
+    """One chat look: colours **and** geometry, defined here and nowhere else.
+
+    Colours are hex strings.  Geometry is unitless so it scales to any canvas:
+    ``*_w`` fractions are of the canvas width, ``*_h`` fractions of the canvas
+    height and ``*_em`` multiples of the base font size.  :func:`_chat_metrics`
+    resolves a theme against a canvas into pixels, and both backends render
+    from that one result.
+    """
 
     name: str
     in_bg: str
@@ -111,10 +142,37 @@ class ChatTheme:
     outline: str = "#000000"
     outline_alpha: float = 0.16
 
+    # -- geometry ---------------------------------------------------------- #
+    font_w: float = 0.0390          # base font size
+    margin_w: float = 0.0550        # side margin of the bubble column
+    avatar_w: float = 0.1050        # avatar disc diameter
+    header_top_h: float = 0.0450    # top of the avatar disc
+    header_gap_h: float = 0.0135    # avatar -> contact name
+    feed_gap_h: float = 0.0190      # contact name -> top of the feed
+    feed_bottom_h: float = 0.7180   # bottom edge of the newest bubble
+    fade_h: float = 0.0700          # length of the fade at the top of the feed
+    row_gap_em: float = 0.46        # vertical gap between bubbles
+    pad_x_em: float = 0.66
+    pad_y_em: float = 0.46
+    radius_em: float = 0.88
+    line_em: float = 1.26           # bubble line height
+    label_em: float = 0.62          # sender caption font size
+    label_gap_em: float = 0.22      # sender caption -> bubble
+    contact_em: float = 0.92        # contact name font size
+    initials_em: float = 1.15       # avatar initials font size
+    bubble_max: float = 0.74        # of the feed width
+    bubble_min_em: float = 2.60
+    dot_em: float = 0.34            # typing dot diameter
+    dot_gap_em: float = 0.34        # gap between typing dots
+    edge_em: float = 0.024          # bubble hairline
+
 
 @dataclass(frozen=True)
 class ForumTheme:
-    """Colour palette for the forum story card (original design)."""
+    """One forum-card look: colours **and** geometry, defined here and nowhere else.
+
+    Same convention as :class:`ChatTheme`; :func:`_forum_metrics` resolves it.
+    """
 
     name: str
     card_bg: str
@@ -129,6 +187,34 @@ class ForumTheme:
     shadow_alpha: float = 0.45
     outline: str = "#000000"
     outline_alpha: float = 0.10
+
+    # -- geometry ---------------------------------------------------------- #
+    font_w: float = 0.0300          # base font size
+    margin_w: float = 0.0700        # gap between card and canvas edge
+    stage_pad_h: float = 0.0450     # minimum gap above/below the card
+    pad_w: float = 0.0520           # card padding
+    radius_w: float = 0.0380        # card corner radius
+    badge_em: float = 2.00          # community badge diameter
+    meta_line: float = 1.30
+    title_em: float = 1.62
+    title_line: float = 1.20
+    body_em: float = 1.06
+    body_line: float = 1.34
+    gap_title_em: float = 0.95      # meta row -> title
+    gap_body_em: float = 0.90       # title -> excerpt
+    gap_row_em: float = 1.25        # excerpt -> chip row
+    chip_h_em: float = 2.30
+    chip_pad_em: float = 0.70
+    chip_gap_em: float = 0.70
+    icon_em: float = 0.52
+    badge_text_em: float = 1.05     # community badge letter
+    meta_gap_em: float = 0.60       # badge -> community name
+    author_gap_em: float = 0.18     # community name -> author
+    shadow_drop_em: float = 0.55
+    shadow_blur_em: float = 0.90
+    edge_em: float = 0.06
+    title_lines: int = 8            # wrapped lines kept before eliding
+    body_lines: int = 7
 
 
 CHAT_THEMES: dict[str, ChatTheme] = {
@@ -191,13 +277,19 @@ FORUM_THEMES: dict[str, ForumTheme] = {
     ),
 }
 
+#: The single source of truth for every overlay look, keyed by surface.  Both
+#: the Pillow backend and the stylesheets behind the Chromium backend read from
+#: here -- the CSS files carry no palette and no measurements of their own.
+THEMES: dict[str, dict[str, ChatTheme] | dict[str, ForumTheme]] = {
+    "chat": CHAT_THEMES,
+    "forum": FORUM_THEMES,
+}
+
+#: Opacity of the three typing dots, oldest first -- shared by both backends.
+_TYPING_DOT_ALPHAS = (0.55, 0.775, 1.0)
+
 DEFAULT_CHAT_THEME = "classic"
 DEFAULT_FORUM_THEME = "dark"
-
-#: How many wrapped lines of the forum card's title/body survive before eliding.
-#: Mirrored by the ``-webkit-line-clamp`` rules in ``templates/forum.css``.
-_FORUM_TITLE_LINES = 8
-_FORUM_BODY_LINES = 7
 
 
 def _chat_theme(name: str | None) -> ChatTheme:
@@ -222,14 +314,31 @@ def _forum_theme(name: str | None) -> ForumTheme:
 # state planning (shared by both backends)
 # --------------------------------------------------------------------------- #
 
-def chat_states(script: ChatScript) -> list[ChatState]:
+def chat_states(script: ChatScript, *, header_state: bool = False) -> list[ChatState]:
     """Plan the conversation states for ``script``.
 
     One state per message, plus one extra *before* every message that carries a
     ``typing`` hint.  Both backends consume this list, which is what keeps them
     in lockstep.
+
+    With ``header_state=True`` the list gains a leading state at index ``0``
+    with ``visible=0``: the header (avatar + contact name) and an empty feed.
+    It exists so a caller can put *something* on screen from ``t=0`` instead of
+    opening on a bare background while the first message waits out its delay.
+    It shifts every following index by one, so pass the same value here and to
+    :func:`render_chat` and read the mapping from ``state.visible`` rather than
+    from the position in the list::
+
+        state.visible == 0                -> header only, no messages
+        state.visible == i + 1, typing=0  -> messages 0..i are on screen
+        state.visible == i,     typing=1  -> messages 0..i-1 plus a typing dot
+                                             bubble for the message about to land
     """
     states: list[ChatState] = []
+    if not script.messages:  # an empty conversation has nothing to hold, header or not
+        return states
+    if header_state:
+        states.append(ChatState(index=0, visible=0, typing=False, outgoing=False))
     for i, msg in enumerate(script.messages):
         if getattr(msg, "typing", 0.0) and msg.typing > 0:
             states.append(ChatState(index=len(states), visible=i, typing=True, outgoing=bool(msg.outgoing)))
@@ -256,6 +365,23 @@ def _hex_rgb(color: str) -> tuple[int, int, int]:
 def _rgba(color: str, alpha: float = 1.0) -> tuple[int, int, int, int]:
     r, g, b = _hex_rgb(color)
     return (r, g, b, max(0, min(255, int(round(alpha * 255)))))
+
+
+def _font_stack(emoji_family: str = "") -> str:
+    """CSS font stack for the Chromium page.
+
+    The colour emoji face goes **last**: it is a fallback for glyphs the text
+    fonts do not carry, and putting it first would hand the browser that font's
+    (very wide) space and digit glyphs for ordinary text.
+    """
+    stack = '"DejaVu Sans", "Liberation Sans", "Noto Sans", Arial, sans-serif'
+    return f'{stack}, "{emoji_family}"' if emoji_family else stack
+
+
+def _css_rgba(color: str, alpha: float = 1.0) -> str:
+    """``"#000000", 0.16`` -> ``"rgba(0, 0, 0, 0.16)"`` -- the same colour Pillow gets."""
+    r, g, b = _hex_rgb(color)
+    return f"rgba({r}, {g}, {b}, {max(0.0, min(1.0, float(alpha))):.4f})"
 
 
 def _initials(text: str, limit: int = 2) -> str:
@@ -316,18 +442,24 @@ _BOLD_NAMES = (
     "DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "FreeSansBold.ttf",
     "NotoSans-Bold.ttf", "Arial Bold.ttf", "arialbd.ttf",
 )
+#: Colour emoji faces, best first.  Preferred over the monochrome outline emoji
+#: that ship inside the text fonts above -- see the module docstring for why
+#: only the Chromium backend can actually use them.
+_EMOJI_NAMES = (
+    "NotoColorEmoji.ttf", "NotoColorEmoji.ttc", "Noto Color Emoji.ttf",
+    "AppleColorEmoji.ttf", "Apple Color Emoji.ttc", "seguiemj.ttf",
+    "TwemojiMozilla.ttf", "EmojiOneColor.otf",
+)
+#: Monochrome emoji faces, used only when no colour font exists at all.
+_EMOJI_FALLBACK_NAMES = ("NotoEmoji-Regular.ttf", "Symbola.ttf", "OpenSansEmoji.ttf")
 
 _font_file_cache: dict[tuple[str, bool], str | None] = {}
+_emoji_font_cache: dict[str, tuple[str, bool] | None] = {}
 
 
-def _font_file(settings: Settings, bold: bool) -> str | None:
-    """Locate a real TTF, preferring ``settings.fonts_dir``."""
-    key = (str(settings.fonts_dir), bold)
-    if key in _font_file_cache:
-        return _font_file_cache[key]
-    names = _BOLD_NAMES if bold else _REGULAR_NAMES
+def _search_fonts(settings: Settings, names: tuple[str, ...]) -> str | None:
+    """First of ``names`` that exists under ``settings.fonts_dir`` or a system dir."""
     roots: list[Path] = [settings.fonts_dir, *(Path(d) for d in _FONT_DIRS)]
-    found: str | None = None
     for root in roots:
         try:
             if not root.is_dir():
@@ -337,10 +469,61 @@ def _font_file(settings: Settings, bold: bool) -> str | None:
         for name in names:
             candidate = root / name
             if candidate.is_file():
-                found = str(candidate)
-                break
-        if found:
-            break
+                return str(candidate)
+        for pattern in ("*/{}", "*/*/{}"):  # e.g. /usr/share/fonts/truetype/noto/<name>
+            for name in names:
+                try:
+                    nested = sorted(root.glob(pattern.format(name)))
+                except OSError:  # pragma: no cover - unreadable mount
+                    nested = []
+                if nested:
+                    return str(nested[0])
+    return None
+
+
+def _emoji_font(settings: Settings) -> tuple[str, bool] | None:
+    """Best emoji face on this machine as ``(path, is_colour)``, colour first.
+
+    Returns ``None`` when the machine has no dedicated emoji font at all, in
+    which case emoji fall back to whatever outline glyphs the text font carries.
+    """
+    key = str(settings.fonts_dir)
+    if key in _emoji_font_cache:
+        return _emoji_font_cache[key]
+    found = _search_fonts(settings, _EMOJI_NAMES)
+    result: tuple[str, bool] | None = (found, True) if found else None
+    if result is None:
+        mono = _search_fonts(settings, _EMOJI_FALLBACK_NAMES)
+        result = (mono, False) if mono else None
+    _emoji_font_cache[key] = result
+    return result
+
+
+def _emoji_family(settings: Settings) -> str:
+    """CSS family name for the preferred emoji face (``""`` when there is none)."""
+    found = _emoji_font(settings)
+    if not found:
+        return ""
+    stem = Path(found[0]).stem
+    # "NotoColorEmoji" -> "Noto Color Emoji", "seguiemj" -> "Segoe UI Emoji"
+    special = {"seguiemj": "Segoe UI Emoji", "TwemojiMozilla": "Twemoji Mozilla"}
+    if stem in special:
+        return special[stem]
+    out: list[str] = []
+    for char in stem.replace("-", " ").replace("_", " "):
+        if char.isupper() and out and out[-1] not in " ":
+            out.append(" ")
+        out.append(char)
+    return "".join(out).strip()
+
+
+def _font_file(settings: Settings, bold: bool) -> str | None:
+    """Locate a real TTF, preferring ``settings.fonts_dir``."""
+    key = (str(settings.fonts_dir), bold)
+    if key in _font_file_cache:
+        return _font_file_cache[key]
+    names = _BOLD_NAMES if bold else _REGULAR_NAMES
+    found: str | None = _search_fonts(settings, names)
     if found is None:
         # last resort: any ttf sitting in the project font directory
         try:
@@ -456,13 +639,25 @@ def _downsample(img: PilImage, factor: int) -> PilImage:
 # chat layout (pillow backend)
 # --------------------------------------------------------------------------- #
 
-@dataclass
+@dataclass(frozen=True)
 class _ChatMetrics:
+    """A :class:`ChatTheme` resolved against one canvas, in device pixels.
+
+    Built once by :func:`_chat_metrics` and consumed by *both* backends: Pillow
+    lays out with these numbers, and :func:`_chat_css_vars` hands the very same
+    numbers to the browser as CSS custom properties.
+    """
+
     w: int
     h: int
+    font_size: int
     margin: int
     header_top: int
     avatar_d: int
+    initials_size: int
+    header_gap: int
+    contact_size: int
+    contact_h: int
     content_top: int
     anchor_y: int
     gap: int
@@ -470,16 +665,105 @@ class _ChatMetrics:
     pad_y: int
     radius: int
     line_h: int
-    line_gap: int
+    label_size: int
+    label_line: int
+    label_h: int
     name_h: int
     outline: int
     max_bubble_w: int
     min_bubble_w: int
     typing_w: int
     typing_h: int
-    dot_r: int
+    dot_d: int
     dot_gap: int
     fade_span: int
+
+
+def _chat_metrics(theme: ChatTheme, width: int, height: int, scale: int = 1) -> _ChatMetrics:
+    """Resolve ``theme``'s geometry against a ``width``x``height`` canvas."""
+    w, h = int(width) * scale, int(height) * scale
+    fs = max(10, round(w * theme.font_w))
+    pad_x = round(fs * theme.pad_x_em)
+    pad_y = round(fs * theme.pad_y_em)
+    line_h = round(fs * theme.line_em)
+    label_size = max(8, round(fs * theme.label_em))
+    label_h = round(label_size * theme.line_em) + round(fs * theme.label_gap_em)
+    contact_size = max(9, round(fs * theme.contact_em))
+    contact_h = round(contact_size * theme.line_em)
+    avatar_d = round(w * theme.avatar_w)
+    header_top = round(h * theme.header_top_h)
+    header_gap = round(h * theme.header_gap_h)
+    margin = round(w * theme.margin_w)
+    dot_d = max(2, round(fs * theme.dot_em))
+    dot_gap = max(1, round(fs * theme.dot_gap_em))
+    return _ChatMetrics(
+        w=w, h=h, font_size=fs, margin=margin,
+        header_top=header_top, avatar_d=avatar_d,
+        initials_size=max(10, round(fs * theme.initials_em)),
+        header_gap=header_gap, contact_size=contact_size, contact_h=contact_h,
+        content_top=header_top + avatar_d + header_gap + contact_h + round(h * theme.feed_gap_h),
+        anchor_y=round(h * theme.feed_bottom_h),
+        gap=round(fs * theme.row_gap_em),
+        pad_x=pad_x, pad_y=pad_y,
+        radius=round(fs * theme.radius_em),
+        line_h=line_h,
+        label_size=label_size, label_line=round(label_size * theme.line_em),
+        label_h=label_h, name_h=label_h,
+        outline=max(1, round(fs * theme.edge_em)),
+        max_bubble_w=round((w - 2 * margin) * theme.bubble_max),
+        min_bubble_w=round(fs * theme.bubble_min_em),
+        typing_w=2 * pad_x + 3 * dot_d + 2 * dot_gap,
+        typing_h=2 * pad_y + line_h,
+        dot_d=dot_d, dot_gap=dot_gap,
+        fade_span=round(h * theme.fade_h),
+    )
+
+
+def _chat_css_vars(theme: ChatTheme, m: _ChatMetrics, avatar_bg: str, emoji_family: str) -> dict[str, str]:
+    """The same theme + metrics, as CSS custom properties for the Chromium page."""
+    return {
+        "--font-stack": _font_stack(emoji_family),
+        "--in-bg": theme.in_bg,
+        "--in-fg": theme.in_fg,
+        "--out-bg": theme.out_bg,
+        "--out-fg": theme.out_fg,
+        "--header-fg": theme.header_fg,
+        "--meta-fg": theme.meta_fg,
+        "--avatar-bg": avatar_bg,
+        "--avatar-fg": theme.avatar_fg,
+        "--dot": theme.dot,
+        "--edge": _css_rgba(theme.outline, theme.outline_alpha),
+        "--fs": f"{m.font_size}px",
+        "--line-h": f"{m.line_h}px",
+        "--pad-x": f"{m.pad_x}px",
+        "--pad-y": f"{m.pad_y}px",
+        "--radius": f"{m.radius}px",
+        "--margin": f"{m.margin}px",
+        "--row-gap": f"{m.gap}px",
+        "--label-fs": f"{m.label_size}px",
+        "--label-h": f"{m.label_h}px",
+        "--label-line": f"{m.label_line}px",
+        "--label-gap": f"{m.label_h - m.label_line}px",
+        "--contact-fs": f"{m.contact_size}px",
+        "--contact-h": f"{m.contact_h}px",
+        "--initials-fs": f"{m.initials_size}px",
+        "--avatar-d": f"{m.avatar_d}px",
+        "--head-top": f"{m.header_top}px",
+        "--head-gap": f"{m.header_gap}px",
+        "--feed-top": f"{m.content_top}px",
+        "--feed-h": f"{max(1, m.anchor_y - m.content_top)}px",
+        "--fade": f"{m.fade_span}px",
+        "--bubble-max": f"{m.max_bubble_w}px",
+        "--bubble-min": f"{m.min_bubble_w}px",
+        "--typing-w": f"{m.typing_w}px",
+        "--typing-h": f"{m.typing_h}px",
+        "--dot-d": f"{m.dot_d}px",
+        "--dot-gap": f"{m.dot_gap}px",
+        "--edge-w": f"{m.outline}px",
+        "--dot-a1": f"{_TYPING_DOT_ALPHAS[0]}",
+        "--dot-a2": f"{_TYPING_DOT_ALPHAS[1]}",
+        "--dot-a3": f"{_TYPING_DOT_ALPHAS[2]}",
+    }
 
 
 @dataclass
@@ -498,52 +782,32 @@ class _ChatCtx:
 
     def __init__(self, script: ChatScript, width: int, height: int, settings: Settings, scale: int):
         self.theme = _chat_theme(script.theme)
-        w, h = width * scale, height * scale
-        font_size = max(10, round(w * 0.0390))
-        self.font = _load_font(settings, font_size, bold=False)
-        self.name_font = _load_font(settings, max(8, round(font_size * 0.62)), bold=True)
-        self.header_font = _load_font(settings, max(9, round(font_size * 0.92)), bold=True)
-        self.avatar_font = _load_font(settings, max(10, round(font_size * 1.15)), bold=True)
-
-        line_h = _line_height(self.font)
-        pad_x = round(font_size * 0.66)
-        pad_y = round(font_size * 0.46)
-        dot_r = max(1, round(font_size * 0.17))
-        dot_gap = max(2, round(font_size * 0.52))
-        typing_w = 2 * pad_x + 2 * dot_gap + 2 * dot_r
-        typing_h = 2 * pad_y + line_h
-        header_top = round(h * 0.045)
-        avatar_d = round(w * 0.105)
-        name_h = round(_line_height(self.name_font) * 1.25)
-        content_top = header_top + avatar_d + round(_line_height(self.header_font) * 1.5) + round(h * 0.018)
-        bottom_safe = round(h * 0.140)
-        anchor_y = content_top + round((h - bottom_safe - content_top) * 0.80)
-        margin = round(w * 0.055)
-        self.m = _ChatMetrics(
-            w=w, h=h, margin=margin,
-            header_top=header_top, avatar_d=avatar_d,
-            content_top=content_top, anchor_y=anchor_y,
-            gap=round(font_size * 0.46),
-            pad_x=pad_x, pad_y=pad_y,
-            radius=round(font_size * 0.88),
-            line_h=line_h, line_gap=round(line_h * 0.22),
-            name_h=name_h,
-            outline=max(1, round(font_size * 0.045)),
-            max_bubble_w=round((w - 2 * margin) * 0.74),
-            min_bubble_w=typing_w + round(font_size * 0.9),
-            typing_w=typing_w, typing_h=typing_h,
-            dot_r=dot_r, dot_gap=dot_gap,
-            fade_span=round(h * 0.07),
-        )
+        self.m = _chat_metrics(self.theme, width, height, scale)
+        m = self.m
+        self.font = _load_font(settings, m.font_size, bold=False)
+        self.name_font = _load_font(settings, m.label_size, bold=True)
+        self.header_font = _load_font(settings, m.contact_size, bold=True)
+        self.avatar_font = _load_font(settings, m.initials_size, bold=True)
+        # CSS centres each glyph inside its line box (half-leading); Pillow draws
+        # from the ascender, so shift by the same half-leading to line up.
+        self.text_dy = max(0, (m.line_h - _line_height(self.font)) // 2)
+        self.label_dy = max(0, (m.label_line - _line_height(self.name_font)) // 2)
+        self.contact_dy = max(0, (m.contact_h - _line_height(self.header_font)) // 2)
 
     # -- measuring --------------------------------------------------------- #
     def measure(self, msg: ChatMessage, label: str) -> _Bubble:
         m = self.m
         inner = m.max_bubble_w - 2 * m.pad_x
         lines = _wrap(msg.text or "", self.font, inner)
-        text_w = max((_text_width(self.font, ln) for ln in lines), default=0.0)
-        w = int(max(m.min_bubble_w, min(m.max_bubble_w, round(text_w) + 2 * m.pad_x)))
-        body_h = 2 * m.pad_y + len(lines) * m.line_h + (len(lines) - 1) * m.line_gap
+        if len(lines) > 1:
+            # A wrapped bubble fills the column.  CSS shrink-to-fit resolves to
+            # max-width as soon as the text no longer fits on one line, so this
+            # is what the Chromium backend does -- match it or the two drift.
+            w = m.max_bubble_w
+        else:
+            text_w = max((_text_width(self.font, ln) for ln in lines), default=0.0)
+            w = int(max(m.min_bubble_w, min(m.max_bubble_w, round(text_w) + 2 * m.pad_x)))
+        body_h = 2 * m.pad_y + len(lines) * m.line_h
         head = m.name_h if label else 0
         return _Bubble(lines=lines, w=w, body_h=body_h, h=body_h + head,
                        outgoing=bool(msg.outgoing), label=label)
@@ -583,7 +847,7 @@ def _draw_chat_header(d: PilDraw, ctx: _ChatCtx, script: ChatScript, settings: S
     d.ellipse((cx - r, top, cx + r, top + m.avatar_d), fill=_rgba(_avatar_color(script, settings)))
     initials = (script.avatar_initials or "").strip() or _initials(script.contact)
     d.text((cx, top + r), initials, font=ctx.avatar_font, fill=_rgba(theme.avatar_fg), anchor="mm")
-    d.text((cx, top + m.avatar_d + round(m.name_h * 0.45)), script.contact.strip(),
+    d.text((cx, top + m.avatar_d + m.header_gap + ctx.contact_dy), script.contact.strip(),
            font=ctx.header_font, fill=_rgba(theme.header_fg), anchor="ma")
 
 
@@ -593,7 +857,7 @@ def _draw_bubble(d: PilDraw, ctx: _ChatCtx, bubble: _Bubble, top: int) -> None:
     y = top
     if bubble.label:
         label_x = x + bubble.w - m.pad_x if bubble.outgoing else x + m.pad_x
-        d.text((label_x, y), bubble.label, font=ctx.name_font,
+        d.text((label_x, y + ctx.label_dy), bubble.label, font=ctx.name_font,
                fill=_rgba(theme.meta_fg), anchor="ra" if bubble.outgoing else "la")
         y += m.name_h
     bg = theme.out_bg if bubble.outgoing else theme.in_bg
@@ -607,17 +871,19 @@ def _draw_bubble(d: PilDraw, ctx: _ChatCtx, bubble: _Bubble, top: int) -> None:
     )
     if bubble.typing:
         cy = y + bubble.body_h // 2
-        cx = x + bubble.w // 2 - m.dot_gap
+        step = m.dot_d + m.dot_gap
+        left = x + bubble.w // 2 - (3 * m.dot_d + 2 * m.dot_gap) // 2
+        radius = m.dot_d / 2.0
         dot = theme.out_fg if bubble.outgoing else theme.dot
         for i in range(3):
-            px = cx + i * m.dot_gap
-            d.ellipse((px - m.dot_r, cy - m.dot_r, px + m.dot_r, cy + m.dot_r),
-                      fill=_rgba(dot, 0.55 + 0.225 * i))
+            px = left + i * step + radius
+            d.ellipse((px - radius, cy - radius, px + radius, cy + radius),
+                      fill=_rgba(dot, _TYPING_DOT_ALPHAS[i]))
         return
-    ty = y + m.pad_y
+    ty = y + m.pad_y + ctx.text_dy
     for line in bubble.lines:
         d.text((x + m.pad_x, ty), line, font=ctx.font, fill=_rgba(fg))
-        ty += m.line_h + m.line_gap
+        ty += m.line_h
 
 
 def _feed_mask(width: int, height: int, top: int, fade: int) -> Any:
@@ -682,6 +948,131 @@ def _render_chat_pillow(
 
 
 # --------------------------------------------------------------------------- #
+# forum card metrics (shared by both backends)
+# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class _ForumMetrics:
+    """A :class:`ForumTheme` resolved against one canvas, in device pixels."""
+
+    w: int
+    h: int
+    base: int
+    margin: int
+    card_w: int
+    pad: int
+    inner: int
+    radius: int
+    stage_pad: int
+    badge_d: int
+    badge_size: int
+    meta_size: int
+    meta_line: int
+    author_gap: int
+    meta_gap: int
+    meta_h: int
+    title_size: int
+    title_lh: int
+    body_size: int
+    body_lh: int
+    gap_title: int
+    gap_body: int
+    gap_row: int
+    chip_h: int
+    chip_pad: int
+    chip_gap: int
+    icon: int
+    edge: int
+    shadow_drop: int
+    shadow_blur: int
+    title_lines: int
+    body_lines: int
+
+
+def _forum_metrics(theme: ForumTheme, width: int, height: int, scale: int = 1) -> _ForumMetrics:
+    """Resolve ``theme``'s geometry against a ``width``x``height`` canvas."""
+    w, h = int(width) * scale, int(height) * scale
+    base = max(10, round(w * theme.font_w))
+    margin = round(w * theme.margin_w)
+    pad = round(w * theme.pad_w)
+    card_w = w - 2 * margin
+    badge_d = round(base * theme.badge_em)
+    meta_line = round(base * theme.meta_line)
+    author_gap = round(base * theme.author_gap_em)
+    meta_h = max(badge_d, 2 * meta_line + author_gap)
+    return _ForumMetrics(
+        w=w, h=h, base=base, margin=margin, card_w=card_w, pad=pad,
+        inner=card_w - 2 * pad,
+        radius=round(w * theme.radius_w),
+        stage_pad=round(h * theme.stage_pad_h),
+        badge_d=badge_d,
+        badge_size=max(8, round(base * theme.badge_text_em)),
+        meta_size=base, meta_line=meta_line, author_gap=author_gap,
+        meta_gap=round(base * theme.meta_gap_em), meta_h=meta_h,
+        title_size=max(10, round(base * theme.title_em)),
+        title_lh=round(base * theme.title_em * theme.title_line),
+        body_size=max(9, round(base * theme.body_em)),
+        body_lh=round(base * theme.body_em * theme.body_line),
+        gap_title=round(base * theme.gap_title_em),
+        gap_body=round(base * theme.gap_body_em),
+        gap_row=round(base * theme.gap_row_em),
+        chip_h=round(base * theme.chip_h_em),
+        chip_pad=round(base * theme.chip_pad_em),
+        chip_gap=round(base * theme.chip_gap_em),
+        icon=round(base * theme.icon_em),
+        edge=max(1, round(base * theme.edge_em)),
+        shadow_drop=round(base * theme.shadow_drop_em),
+        shadow_blur=round(base * theme.shadow_blur_em),
+        title_lines=int(theme.title_lines),
+        body_lines=int(theme.body_lines),
+    )
+
+
+def _forum_css_vars(theme: ForumTheme, m: _ForumMetrics, emoji_family: str) -> dict[str, str]:
+    """The same theme + metrics, as CSS custom properties for the Chromium page."""
+    return {
+        "--font-stack": _font_stack(emoji_family),
+        "--card-bg": theme.card_bg,
+        "--title-fg": theme.title_fg,
+        "--body-fg": theme.body_fg,
+        "--meta-fg": theme.meta_fg,
+        "--accent": theme.accent,
+        "--chip-bg": theme.chip_bg,
+        "--chip-fg": theme.chip_fg,
+        "--badge-fg": theme.badge_fg,
+        "--shadow": _css_rgba(theme.shadow, theme.shadow_alpha),
+        "--edge": _css_rgba(theme.outline, theme.outline_alpha),
+        "--fs": f"{m.meta_size}px",
+        "--meta-line": f"{m.meta_line}px",
+        "--author-gap": f"{m.author_gap}px",
+        "--meta-gap": f"{m.meta_gap}px",
+        "--meta-h": f"{m.meta_h}px",
+        "--badge-d": f"{m.badge_d}px",
+        "--badge-fs": f"{m.badge_size}px",
+        "--title-fs": f"{m.title_size}px",
+        "--title-lh": f"{m.title_lh}px",
+        "--body-fs": f"{m.body_size}px",
+        "--body-lh": f"{m.body_lh}px",
+        "--gap-title": f"{m.gap_title}px",
+        "--gap-body": f"{m.gap_body}px",
+        "--gap-row": f"{m.gap_row}px",
+        "--chip-h": f"{m.chip_h}px",
+        "--chip-pad": f"{m.chip_pad}px",
+        "--chip-gap": f"{m.chip_gap}px",
+        "--icon": f"{m.icon}px",
+        "--edge-w": f"{m.edge}px",
+        "--card-margin": f"{m.margin}px",
+        "--card-pad": f"{m.pad}px",
+        "--card-radius": f"{m.radius}px",
+        "--stage-pad": f"{m.stage_pad}px",
+        "--shadow-y": f"{m.shadow_drop}px",
+        "--shadow-blur": f"{m.shadow_blur}px",
+        "--title-clamp": f"{m.title_lines}",
+        "--body-clamp": f"{m.body_lines}",
+    }
+
+
+# --------------------------------------------------------------------------- #
 # forum card (pillow backend)
 # --------------------------------------------------------------------------- #
 
@@ -696,41 +1087,35 @@ def _render_forum_pillow(
 
     scale = 2 if width * height <= 1080 * 1920 else 1
     theme = _forum_theme(post.theme)
-    w, h = width * scale, height * scale
+    fm = _forum_metrics(theme, width, height, scale)
+    w, h = fm.w, fm.h
+    base = fm.base
 
-    base = max(10, round(w * 0.030))
-    f_meta = _load_font(settings, base, bold=False)
-    f_meta_b = _load_font(settings, base, bold=True)
-    f_title = _load_font(settings, round(base * 1.62), bold=True)
-    f_body = _load_font(settings, round(base * 1.06), bold=False)
-    f_badge = _load_font(settings, round(base * 1.05), bold=True)
+    f_meta = _load_font(settings, fm.meta_size, bold=False)
+    f_meta_b = _load_font(settings, fm.meta_size, bold=True)
+    f_title = _load_font(settings, fm.title_size, bold=True)
+    f_body = _load_font(settings, fm.body_size, bold=False)
+    f_badge = _load_font(settings, fm.badge_size, bold=True)
 
-    margin = round(w * 0.070)
-    card_w = w - 2 * margin
-    pad = round(w * 0.052)
-    inner = card_w - 2 * pad
-    radius = round(w * 0.038)
+    margin, card_w, pad, inner, radius = fm.margin, fm.card_w, fm.pad, fm.inner, fm.radius
+    badge_d, meta_h = fm.badge_d, fm.meta_h
+    title_lh, body_lh = fm.title_lh, fm.body_lh
+    chip_h, gap_title, gap_body, gap_row = fm.chip_h, fm.gap_title, fm.gap_body, fm.gap_row
+    # CSS centres a glyph in its line box; Pillow draws from the ascender.
+    title_dy = max(0, (title_lh - _line_height(f_title)) // 2)
+    body_dy = max(0, (body_lh - _line_height(f_body)) // 2)
 
-    badge_d = round(base * 2.0)
-    meta_h = max(badge_d, round(_line_height(f_meta) * 2.2))
     title_lines = _wrap(post.title or "", f_title, inner)
-    if len(title_lines) > _FORUM_TITLE_LINES:
-        title_lines = title_lines[:_FORUM_TITLE_LINES]
+    if len(title_lines) > fm.title_lines:
+        title_lines = title_lines[:fm.title_lines]
         title_lines[-1] = _ellipsize(title_lines[-1])
-    title_lh = round(_line_height(f_title) * 1.20)
 
     body_lines: list[str] = []
-    body_lh = round(_line_height(f_body) * 1.34)
     if (post.body or "").strip():
         body_lines = _wrap(post.body.strip(), f_body, inner)
-        if len(body_lines) > _FORUM_BODY_LINES:
-            body_lines = body_lines[:_FORUM_BODY_LINES]
+        if len(body_lines) > fm.body_lines:
+            body_lines = body_lines[:fm.body_lines]
             body_lines[-1] = _ellipsize(body_lines[-1])
-
-    chip_h = round(base * 2.3)
-    gap_title = round(base * 0.95)
-    gap_body = round(base * 1.05)
-    gap_row = round(base * 1.25)
 
     def card_height(n_title: int, n_body: int) -> int:
         total = pad * 2 + meta_h + gap_title + n_title * title_lh
@@ -740,7 +1125,7 @@ def _render_forum_pillow(
 
     # An over-long title or body must never push the card (and its vote chips)
     # off the canvas: trim the excerpt first, then the title, adding an ellipsis.
-    max_card_h = h - 2 * round(h * 0.045)
+    max_card_h = h - 2 * fm.stage_pad
     while body_lines and card_height(len(title_lines), len(body_lines)) > max_card_h:
         body_lines.pop()
         if body_lines:
@@ -751,23 +1136,26 @@ def _render_forum_pillow(
     card_h = card_height(len(title_lines), len(body_lines))
 
     x0 = margin
-    y0 = max(round(h * 0.05), (h - card_h) // 2)
+    y0 = max(fm.stage_pad, (h - card_h) // 2)
     x1, y1 = x0 + card_w, y0 + card_h
 
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
 
     shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     sd = ImageDraw.Draw(shadow, "RGBA")
-    drop = round(base * 0.55)
-    sd.rounded_rectangle((x0, y0 + drop, x1, y1 + drop), radius=radius,
+    sd.rounded_rectangle((x0, y0 + fm.shadow_drop, x1, y1 + fm.shadow_drop), radius=radius,
                          fill=_rgba(theme.shadow, theme.shadow_alpha))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(round(base * 0.9)))
+    # CSS `box-shadow ... <blur>` spreads over a Gaussian of *sigma = blur / 2*
+    # (CSS Backgrounds 3, "shadow blur radius"), while Pillow's GaussianBlur
+    # takes sigma directly.  Handing it the blur radius made the Pillow card's
+    # shadow reach roughly twice as far as the Chromium one's -- a soft halo
+    # instead of a drop -- so halve it and the two backends match.
+    shadow = shadow.filter(ImageFilter.GaussianBlur(fm.shadow_blur / 2.0))
     img.alpha_composite(shadow)
 
     d = ImageDraw.Draw(img, "RGBA")
     d.rounded_rectangle((x0, y0, x1, y1), radius=radius, fill=_rgba(theme.card_bg),
-                        outline=_rgba(theme.outline, theme.outline_alpha),
-                        width=max(1, round(base * 0.06)))
+                        outline=_rgba(theme.outline, theme.outline_alpha), width=fm.edge)
 
     cx = x0 + pad
     cy = y0 + pad
@@ -778,29 +1166,30 @@ def _render_forum_pillow(
     d.ellipse((cx, bcy - br, cx + badge_d, bcy + br), fill=_rgba(theme.accent))
     d.text((cx + br, bcy), _badge_letter(post.community), font=f_badge,
            fill=_rgba(theme.badge_fg), anchor="mm")
-    tx = cx + badge_d + round(base * 0.6)
+    tx = cx + badge_d + fm.meta_gap
     community = (post.community or "").strip()
     author = (post.author or "").strip()
-    d.text((tx, bcy - round(_line_height(f_meta_b) * 0.52)), community, font=f_meta_b,
-           fill=_rgba(theme.accent), anchor="ls")
+    stack_h = fm.meta_line * (2 if author else 1) + (fm.author_gap if author else 0)
+    ty = bcy - stack_h // 2 + max(0, (fm.meta_line - _line_height(f_meta_b)) // 2)
+    d.text((tx, ty), community, font=f_meta_b, fill=_rgba(theme.accent), anchor="la")
     if author:
-        d.text((tx, bcy + round(_line_height(f_meta) * 0.92)), author, font=f_meta,
-               fill=_rgba(theme.meta_fg), anchor="ls")
+        d.text((tx, ty + fm.meta_line + fm.author_gap), author, font=f_meta,
+               fill=_rgba(theme.meta_fg), anchor="la")
 
     cy += meta_h + gap_title
     for line in title_lines:
-        d.text((cx, cy), line, font=f_title, fill=_rgba(theme.title_fg))
+        d.text((cx, cy + title_dy), line, font=f_title, fill=_rgba(theme.title_fg))
         cy += title_lh
 
     if body_lines:
         cy += gap_body
         for line in body_lines:
-            d.text((cx, cy), line, font=f_body, fill=_rgba(theme.body_fg))
+            d.text((cx, cy + body_dy), line, font=f_body, fill=_rgba(theme.body_fg))
             cy += body_lh
 
     cy = y1 - pad - chip_h
-    chip_pad = round(base * 0.7)
-    icon = round(base * 0.52)
+    chip_pad = fm.chip_pad
+    icon = fm.icon
 
     votes = _short_count(post.upvotes)
     chip1_w = chip_pad * 2 + icon * 2 + round(base * 0.5) + round(_text_width(f_meta_b, votes))
@@ -813,7 +1202,7 @@ def _render_forum_pillow(
            fill=_rgba(theme.chip_fg), anchor="lm")
 
     comments = _short_count(post.comments)
-    cx2 = cx + chip1_w + round(base * 0.7)
+    cx2 = cx + chip1_w + fm.chip_gap
     chip2_w = chip_pad * 2 + icon * 2 + round(base * 0.5) + round(_text_width(f_meta_b, comments))
     d.rounded_rectangle((cx2, cy, cx2 + chip2_w, cy + chip_h), radius=chip_h // 2, fill=_rgba(theme.chip_bg))
     bx = cx2 + chip_pad
@@ -941,13 +1330,17 @@ def _page_html(html_name: str, css_name: str) -> str:
     return html.replace("<!--STYLE-->", f"<style>\n{css}\n</style>")
 
 
-def _chat_payload(script: ChatScript) -> dict[str, Any]:
+def _chat_payload(script: ChatScript, width: int, height: int, settings: Settings) -> dict[str, Any]:
+    """Everything the page needs, including the resolved theme as CSS variables."""
     labels = _sender_labels(script)
+    theme = _chat_theme(script.theme)
+    metrics = _chat_metrics(theme, width, height)
     return {
         "title": script.title,
         "contact": script.contact,
         "initials": (script.avatar_initials or "").strip() or _initials(script.contact),
-        "theme": _chat_theme(script.theme).name,
+        "theme": theme.name,
+        "vars": _chat_css_vars(theme, metrics, _avatar_color(script, settings), _emoji_family(settings)),
         "messages": [
             {"sender": m.sender, "text": m.text, "outgoing": bool(m.outgoing), "label": labels[i]}
             for i, m in enumerate(script.messages)
@@ -965,7 +1358,7 @@ def _render_chat_chromium(
 ) -> list[OverlayImage]:
     sync_playwright = _require_playwright()
     html = _page_html("chat.html", "chat.css")
-    payload = _chat_payload(script)
+    payload = _chat_payload(script, width, height, settings)
     images: list[OverlayImage] = []
     with sync_playwright() as pw:
         browser = _launch_chromium(pw, settings)
@@ -996,6 +1389,7 @@ def _render_forum_chromium(
 ) -> OverlayImage:
     sync_playwright = _require_playwright()
     html = _page_html("forum.html", "forum.css")
+    theme = _forum_theme(post.theme)
     payload = {
         "community": post.community,
         "author": post.author,
@@ -1004,7 +1398,8 @@ def _render_forum_chromium(
         "upvotes": _short_count(post.upvotes),
         "comments": _short_count(post.comments),
         "badge": _badge_letter(post.community),
-        "theme": _forum_theme(post.theme).name,
+        "theme": theme.name,
+        "vars": _forum_css_vars(theme, _forum_metrics(theme, width, height), _emoji_family(settings)),
     }
     with sync_playwright() as pw:
         browser = _launch_chromium(pw, settings)
@@ -1075,19 +1470,41 @@ def render_chat(
     height: int,
     settings: Settings | None = None,
     backend: str | None = None,
+    header_state: bool = False,
 ) -> list[OverlayImage]:
     """Render one transparent PNG per conversation state into ``out_dir``.
 
-    Image ``i`` shows messages ``0..i``; a message with ``typing > 0`` gets an
-    extra preceding state that shows the typing indicator on its side.  The
-    returned list is ordered and its ``index`` values are ``0..n-1``.
+    The returned list is ordered and its ``index`` values are ``0..n-1``, which
+    are also the ``chat_NNN.png`` file numbers.  **How the indices map to
+    messages** (an off-by-one here is a visible bug, so read it from
+    :func:`chat_states` rather than counting positions by hand):
+
+    ``header_state=False`` (the default, and what the ``texts`` pipeline
+    currently assumes) -- state ``0`` is the first message::
+
+        [msg 0] [typing?] [msg 1] ... [msg n-1]
+
+    ``header_state=True`` -- one extra leading state is inserted, so every
+    message state moves one place to the right::
+
+        [header only] [msg 0] [typing?] [msg 1] ... [msg n-1]
+
+    The leading state paints the chrome (avatar + contact name) over an empty
+    feed.  A caller should hold it from ``t=0`` until the first message lands;
+    without it the video opens on a bare background, because the header lives
+    inside the state images.  The robust way to place a state is by its own
+    fields -- ``visible == 0`` is the header, ``visible == i + 1`` with
+    ``typing`` false shows messages ``0..i`` -- which is exactly what
+    :func:`chat_states` returns, called with the *same* ``header_state`` value.
+
+    A conversation with no messages renders nothing under either setting.
     """
     s = settings or get_settings()
     if width <= 0 or height <= 0:
         raise OverlayError(f"canvas size must be positive, got {width}x{height}")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    states = chat_states(script)
+    states = chat_states(script, header_state=header_state)
     name, may_fall_back = _pick_backend(backend, s)
     if not states:
         log.info("chat script %r has no messages; nothing to render", script.title or script.contact)

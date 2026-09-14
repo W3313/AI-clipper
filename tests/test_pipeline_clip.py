@@ -479,3 +479,165 @@ def test_captions_off_never_validates_the_style(make_video, fake_asr, stub_rende
     )
 
     assert results and results[0].metadata["style"] is None
+
+
+# --------------------------------------------------------------------------- #
+# the clip's clock: captions must not outlive the video, words must be whole
+# --------------------------------------------------------------------------- #
+
+def _offset_speech(duration: float, *, per_word: float = 0.4, stride: float = 0.45) -> Transcript:
+    """Words on a grid that deliberately straddles round-number boundaries.
+
+    ``stride`` is wider than ``per_word``, so word *n* covers
+    ``[0.45n, 0.45n + 0.4)`` -- every whole second lands inside a word rather
+    than in the gap between two.  That is what an evenly spaced fallback window
+    (or a window clamped to the probed media duration) cuts through.
+    """
+    tokens = "here is the part nobody tells you about shipping something people want".split()
+    words: list[Word] = []
+    index = 0
+    while index * stride + per_word <= duration:
+        words.append(
+            Word(tokens[index % len(tokens)], round(index * stride, 3), round(index * stride + per_word, 3))
+        )
+        index += 1
+    transcript = Transcript.from_words(words, language="en")
+    transcript.duration = duration
+    return transcript
+
+
+def _dialogue_spans(ass_path: Path) -> list[tuple[float, float]]:
+    """Every ``Dialogue:`` line of an ASS file as ``(start, end)`` seconds."""
+
+    def _seconds(stamp: str) -> float:
+        hours, minutes, rest = stamp.strip().split(":")
+        return int(hours) * 3600 + int(minutes) * 60 + float(rest)
+
+    spans: list[tuple[float, float]] = []
+    for line in Path(ass_path).read_text(encoding="utf-8").splitlines():
+        if line.startswith("Dialogue:"):
+            fields = line.split(",")
+            spans.append((_seconds(fields[1]), _seconds(fields[2])))
+    assert spans, f"{ass_path} carries no dialogue lines"
+    return spans
+
+
+@pytest.mark.parametrize(
+    ("seconds", "count", "low", "high"),
+    [(10.0, 1, 2.0, 3.0), (12.0, 2, 2.5, 4.0), (12.0, 3, 3.0, 5.0)],
+)
+def test_no_caption_cue_outlives_the_clip(
+    make_video, fake_asr, stub_render, seconds: float, count: int, low: float, high: float
+):
+    """A cue that ends after the last frame is a caption nobody ever sees."""
+    source = make_video("talk.mp4", seconds=seconds, width=640, height=360, fps=12)
+    fake_asr(_offset_speech(seconds))
+
+    results = clip.run(source, count=count, min_duration=low, max_duration=high)
+
+    assert results
+    for (timeline, _out, _cmd), result in zip(stub_render, results, strict=True):
+        assert timeline.subtitles is not None
+        spans = _dialogue_spans(timeline.subtitles.ass_path)
+        duration = float(timeline.duration)
+        assert duration == pytest.approx(result.metadata["clip_duration"])
+        assert max(end for _start, end in spans) <= duration + 1e-6
+        assert all(start < duration for start, _end in spans)
+        assert min(start for start, _end in spans) >= -1e-6
+
+
+def test_the_clip_ends_on_a_whole_word(make_video, fake_asr, stub_render):
+    """No word may straddle either edge of the window the clip is cut from."""
+    source = make_video("talk.mp4", seconds=12.0, width=640, height=360, fps=12)
+    transcript = _offset_speech(12.0)
+    fake_asr(transcript)
+
+    results = clip.run(source, count=3, min_duration=2.0, max_duration=3.0)
+
+    assert results
+    for result in results:
+        start, end = result.metadata["window"]
+        straddling = [
+            w
+            for w in transcript.words
+            if (w.start < start - 1e-6 < w.end) or (w.start < end - 1e-6 < w.end - 1e-6)
+        ]
+        assert straddling == [], f"window {start}-{end} cuts {straddling}"
+        # The rebased words really are whole: same length as in the source.
+        assert result.transcript is not None and result.transcript.words
+        for rebased, source_word in zip(
+            result.transcript.words,
+            [w for w in transcript.words if w.start >= start - 1e-6 and w.end <= end + 1e-6],
+            strict=True,
+        ):
+            assert rebased.text == source_word.text
+            assert rebased.end - rebased.start == pytest.approx(source_word.end - source_word.start)
+        assert result.transcript.words[-1].end <= result.metadata["clip_duration"] + 1e-6
+
+
+def test_even_window_fallback_snaps_to_word_edges(make_video, fake_asr, stub_render, monkeypatch):
+    """Evenly spaced windows know nothing about speech -- the pipeline must."""
+    from aiclipper import highlight as highlight_module
+
+    monkeypatch.setattr(highlight_module, "select", lambda *a, **k: [])
+    source = make_video("talk.mp4", seconds=12.0, width=640, height=360, fps=12)
+    transcript = _offset_speech(12.0)
+    fake_asr(transcript)
+
+    results = clip.run(source, count=2, min_duration=4.0, max_duration=5.0)
+
+    assert results and all(r.metadata["selection"] == "even" for r in results)
+    for result in results:
+        start, end = result.metadata["window"]
+        assert any(w.start == pytest.approx(start) for w in transcript.words) or start == 0.0
+        assert any(w.end == pytest.approx(end) for w in transcript.words)
+        assert result.transcript is not None
+        last = result.transcript.words[-1]
+        assert last.end <= result.metadata["clip_duration"] + 1e-6
+        assert last.end - last.start == pytest.approx(0.4)
+
+
+def test_a_window_clamped_to_the_media_drops_the_half_word(make_video, fake_asr, stub_render):
+    """ASR that runs past the probed duration must not leave a cut word behind."""
+    # The media is 6.0s; the transcript's last word runs to 6.25s.
+    source = make_video("talk.mp4", seconds=6.0, width=640, height=360, fps=12)
+    transcript = _offset_speech(6.4)
+    assert transcript.words[-1].end > 6.0
+    fake_asr(transcript)
+
+    results = clip.run(source, count=1, min_duration=5.0, max_duration=8.0)
+
+    assert results
+    start, end = results[0].metadata["window"]
+    assert end <= 6.0 + 1e-6
+    assert any(w.end == pytest.approx(end) for w in transcript.words)
+    assert results[0].transcript is not None
+    assert results[0].transcript.words[-1].end - results[0].transcript.words[-1].start == pytest.approx(0.4)
+
+
+def test_audio_and_caption_clocks_agree_at_the_boundary(make_video, fake_asr, tmp_path: Path):
+    """Render for real: the encoded clip is as long as its caption track claims."""
+    source = make_video("talk.mp4", seconds=12.0, width=640, height=360, fps=12)
+    fake_asr(_offset_speech(12.0))
+
+    results = clip.run(
+        source, count=1, min_duration=3.0, max_duration=4.0, out_dir=tmp_path / "shorts"
+    )
+
+    assert len(results) == 1
+    result = results[0]
+    info = ff.probe(result.output)
+    window = result.metadata["window"]
+    clip_duration = window[1] - window[0]
+    assert info.duration == pytest.approx(clip_duration, abs=0.2)
+
+    burned = [
+        path
+        for path in Path(get_settings().work_dir).glob("**/captions/*.ass")
+        if path.stem.startswith("talk-01-")
+    ]
+    assert len(burned) == 1, burned
+    spans = _dialogue_spans(burned[0])
+    assert max(end for _s, end in spans) <= clip_duration + 1e-6
+    # The final cue reaches the end of the clip: no dead tail, no overrun.
+    assert max(end for _s, end in spans) >= clip_duration - 0.35

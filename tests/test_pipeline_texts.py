@@ -181,23 +181,23 @@ def test_state_spans_map_every_overlay_state_by_index():
     holds = [1.0, 1.5, 2.0, 1.25]
     beats = texts.plan_beats(script.messages, holds)
     total = beats[-1].end + texts.TAIL_SECONDS
-    states = overlays.chat_states(script)
+    states = overlays.chat_states(script, header_state=True)
     spans = texts.state_spans(script, beats, total)
 
-    # one state per message plus the single typing frame, in overlay order
+    # the header, then one state per message plus the single typing frame
     assert [(s.visible, s.typing) for s in states] == [
-        (1, False), (2, False), (2, True), (3, False), (4, False),
+        (0, False), (1, False), (2, False), (2, True), (3, False), (4, False),
     ]
     assert len(spans) == len(states)
 
     # the typing frame occupies exactly the typing beat of message 2
-    typing_span = spans[2]
+    typing_span = spans[3]
     assert typing_span == (pytest.approx(beats[2].typing_start), pytest.approx(beats[2].start))
     assert typing_span[1] - typing_span[0] == pytest.approx(0.9)
 
     # every bubble frame starts exactly when its own message starts
     for position, state in enumerate(states):
-        if not state.typing:
+        if not state.typing and state.visible:
             assert spans[position][0] == pytest.approx(beats[state.visible - 1].start)
 
     # contiguous, no gaps, no overlaps, and the last one holds to the end
@@ -205,6 +205,77 @@ def test_state_spans_map_every_overlay_state_by_index():
         assert end == pytest.approx(next_start)
     assert all(end > start for start, end in spans)
     assert spans[-1][1] == pytest.approx(total)
+
+
+def test_state_spans_hold_the_header_from_the_very_first_frame():
+    """The video must not open on a bare background during message 0's delay."""
+    script = typed_script()
+    beats = texts.plan_beats(script.messages, [1.0, 1.5, 2.0, 1.25])
+    states = overlays.chat_states(script, header_state=True)
+    spans = texts.state_spans(script, beats, beats[-1].end + texts.TAIL_SECONDS)
+
+    assert states[0].visible == 0 and not states[0].typing, "state 0 is the chrome-only frame"
+    assert spans[0][0] == 0.0, "the header has to be on screen at t=0"
+    assert spans[0][1] == pytest.approx(beats[0].start) == pytest.approx(0.5)
+    # and it is the *only* thing on screen until the first bubble lands
+    assert spans[1][0] == pytest.approx(beats[0].start)
+
+
+def test_a_first_message_at_t_zero_leaves_the_header_no_room_without_breaking_the_tiling():
+    """A conversation that starts instantly still keeps image/span parity."""
+    script = ChatScript(
+        title="Instant",
+        contact="Robin",
+        messages=[
+            ChatMessage(sender="Robin", text="now", delay=0.0),
+            ChatMessage(sender="Me", text="ok", outgoing=True, delay=0.4),
+        ],
+    )
+    beats = texts.plan_beats(script.messages, [1.0, 1.0])
+    total = beats[-1].end + texts.TAIL_SECONDS
+    states = overlays.chat_states(script, header_state=True)
+    spans = texts.state_spans(script, beats, total)
+
+    assert len(spans) == len(states) == 3
+    assert spans[0] == (0.0, 0.0), "an empty header span, not an overlapping one"
+    for (_, end), (next_start, _) in zip(spans, spans[1:], strict=False):
+        assert end == pytest.approx(next_start), "a gap or an overlap between states"
+    assert spans[-1][1] == pytest.approx(total)
+
+
+def test_a_typing_hint_shorter_than_the_floor_does_not_overlap_the_bubble():
+    """A sub-MIN_STATE_SECONDS beat must still tile, not overrun its successor.
+
+    The floor can only ever extend the *last* span: every other state gives way
+    the instant the next one appears, and :func:`texts.state_frames` places the
+    cuts from the starts alone, so padding a short span would put an overlap in
+    the metadata and buy the state nothing on screen.
+    """
+    tiny = texts.MIN_STATE_SECONDS / 10
+    script = ChatScript(
+        title="Blink",
+        contact="Robin",
+        messages=[
+            ChatMessage(sender="Robin", text="a", delay=0.0, typing=tiny),
+            ChatMessage(sender="Me", text="b", outgoing=True, delay=0.0, typing=tiny),
+        ],
+    )
+    beats = texts.plan_beats(script.messages, [1.0, 1.0])
+    total = beats[-1].end + texts.TAIL_SECONDS
+    states = overlays.chat_states(script, header_state=True)
+    spans = texts.state_spans(script, beats, total)
+
+    assert len(spans) == len(states) == 5
+    for (start, end), (next_start, _) in zip(spans, spans[1:], strict=False):
+        assert end >= start, "a span that ends before it begins"
+        assert end == pytest.approx(next_start), "a gap or an overlap between states"
+    assert spans[-1][1] == pytest.approx(total)
+
+    # and the composited layer still tiles the whole programme, frame for frame
+    edges = texts.state_frames(spans, fps=30, duration=total)
+    assert edges == sorted(edges)
+    assert edges[0] == 0
+    assert sum(edges[i + 1] - edges[i] for i in range(len(spans))) == edges[-1]
 
 
 # --------------------------------------------------------------------------- #
@@ -225,47 +296,85 @@ def test_texts_end_to_end_produces_a_real_video(env, spy: RenderSpy):
     assert result.metadata["spoken_messages"] == 4
 
 
-def test_state_count_equals_the_layer_count_and_the_spans_tile_the_timeline(env, spy: RenderSpy):
+def test_the_conversation_is_one_layer_and_its_states_tile_the_timeline(env, spy: RenderSpy):
     script = typed_script()
     result = run(script=script)
     timeline = spy.timeline
 
-    states = overlays.chat_states(script)
+    states = overlays.chat_states(script, header_state=True)
     layers = chat_layers(timeline)
-    assert len(states) == 5, "four messages plus one typing frame"
-    assert len(layers) == len(states) == result.metadata["states"]
+    assert len(states) == 6, "the header, four messages and one typing frame"
+    assert result.metadata["states"] == len(states)
 
-    frames = sorted(Path(layer.src) for layer in layers)
-    assert len(set(frames)) == len(frames), "every state has its own PNG"
-    for path in frames:
-        assert path.exists() and path.stat().st_size > 0
+    # one pre-composited layer, whatever the message count
+    assert len(layers) == 1
+    layer = layers[0]
+    assert layer.kind == "video"
+    assert Path(layer.src).exists() and Path(layer.src).stat().st_size > 0
+    assert (layer.start, layer.end) == (0.0, pytest.approx(timeline.duration))
 
-    spans = [(layer.start, layer.end) for layer in layers]
-    assert spans == sorted(spans), "layers are added in state order"
+    frames = sorted((env.work_dir).rglob("states/chat_*.png"))
+    assert len(frames) == len(states), "every state still has its own PNG"
+
+    spans = [(t["start"], t["end"]) for t in result.metadata["state_timings"]]
+    assert spans == sorted(spans), "states are reported in overlay order"
     for (_, end), (next_start, _) in zip(spans, spans[1:], strict=False):
         assert end == pytest.approx(next_start), "a gap or an overlap between states"
+    assert spans[0][0] == 0.0, "the header is up from the first frame"
     assert spans[-1][1] == pytest.approx(timeline.duration)
-    assert all(end > start for start, end in spans)
-    assert spans[0][0] == pytest.approx(0.5), "the first bubble waits out its own delay"
+    assert spans[1][0] == pytest.approx(0.5), "the first bubble waits out its own delay"
+
+
+def test_the_graph_does_not_grow_with_the_message_count(env, spy: RenderSpy):
+    """The performance fix, stated as an invariant: one overlay, always.
+
+    Before the states were pre-composited the filter graph carried one
+    full-canvas RGBA ``overlay`` per conversation state, so a long chat paid for
+    every one of them on every frame of the finished video.
+    """
+    def conversation(count: int) -> ChatScript:
+        return ChatScript(
+            title=f"Thread {count}",
+            contact="Robin",
+            messages=[
+                ChatMessage(sender="Me" if i % 2 else "Robin", text=f"message number {i}",
+                            outgoing=bool(i % 2), delay=0.3, typing=0.4 if i % 3 == 2 else 0.0)
+                for i in range(count)
+            ],
+        )
+
+    short = run(script=conversation(3))
+    long = run(script=conversation(9))
+    assert long.metadata["states"] > short.metadata["states"] + 4
+
+    # the background and the one conversation layer -- and nothing else, at any length
+    overlays_in = [" ".join(command).count("overlay=") for command in spy.commands]
+    assert overlays_in == [2, 2], (
+        f"the graph grew from {overlays_in[0]} to {overlays_in[1]} overlays with the message count"
+    )
+    # one scale/pad chain per conversation state was the other half of the cost
+    pads = [" ".join(command).count("pad=") for command in spy.commands]
+    assert pads == [1, 1], f"the graph grew from {pads[0]} to {pads[1]} padded layers"
+    assert len(chat_layers(spy.timelines[0])) == len(chat_layers(spy.timelines[1])) == 1
 
 
 def test_the_typing_frame_covers_exactly_the_typing_beat(env, spy: RenderSpy):
     script = typed_script()
     result = run(script=script)
 
-    states = overlays.chat_states(script)
-    layers = chat_layers(spy.timeline)
-    typing_positions = [i for i, state in enumerate(states) if state.typing]
-    assert typing_positions == [2]
+    states = result.metadata["state_timings"]
+    typing_positions = [i for i, state in enumerate(states) if state["typing"]]
+    assert typing_positions == [3]
 
-    typing_layer = layers[typing_positions[0]]
-    bubble_layer = layers[typing_positions[0] + 1]
-    assert typing_layer.end - typing_layer.start == pytest.approx(0.9, abs=0.01)
-    assert typing_layer.end == pytest.approx(bubble_layer.start)
+    typing_state = states[typing_positions[0]]
+    bubble_state = states[typing_positions[0] + 1]
+    assert typing_state["end"] - typing_state["start"] == pytest.approx(0.9, abs=0.01)
+    assert typing_state["end"] == pytest.approx(bubble_state["start"])
 
     timings = result.metadata["message_timings"]
     assert timings[2]["typing"] == pytest.approx(0.9)
-    assert bubble_layer.start == pytest.approx(timings[2]["start"], abs=0.001)
+    assert bubble_state["start"] == pytest.approx(timings[2]["start"], abs=0.001)
+    assert bubble_state["visible"] == 3, "the bubble frame that follows the typing one"
 
 
 def test_every_message_audio_starts_when_its_bubble_appears(env, spy: RenderSpy):
@@ -273,17 +382,16 @@ def test_every_message_audio_starts_when_its_bubble_appears(env, spy: RenderSpy)
     result = run(script=script)
     timeline = spy.timeline
 
-    states = overlays.chat_states(script)
-    layers = chat_layers(timeline)
+    states = result.metadata["state_timings"]
     voices = voice_tracks(timeline)
     assert len(voices) == len(script.messages) == 4
 
-    # independently recompute which layer shows message i's bubble
+    # independently recompute which state shows message i's bubble
     for index, track in enumerate(voices):
-        position = next(
-            i for i, state in enumerate(states) if not state.typing and state.visible == index + 1
+        state = next(
+            s for s in states if not s["typing"] and s["visible"] == index + 1
         )
-        assert track.start == pytest.approx(layers[position].start), f"message {index} is out of sync"
+        assert track.start == pytest.approx(state["start"]), f"message {index} is out of sync"
         assert track.label == f"voice:{index:03d}"
         assert Path(track.src).exists()
         # the voice must finish before the *next* message's bubble arrives
@@ -317,6 +425,148 @@ def test_total_duration_is_delays_plus_typing_plus_narration_plus_tail(env, spy:
 
 
 # --------------------------------------------------------------------------- #
+# the pre-composited conversation layer
+# --------------------------------------------------------------------------- #
+
+def _concat_durations(work_dir: Path) -> list[float]:
+    """The ``duration`` directives the pipeline wrote for the concat demuxer."""
+    lists = sorted(work_dir.rglob("chat_states.concat"))
+    assert len(lists) == 1, f"expected one concat list, found {lists}"
+    return [
+        float(line.split(" ", 1)[1])
+        for line in lists[0].read_text(encoding="utf-8").splitlines()
+        if line.startswith("duration ")
+    ]
+
+
+def _state_video(work_dir: Path) -> Path:
+    videos = sorted(work_dir.rglob("chat_states.*"))
+    videos = [v for v in videos if v.suffix != ".concat"]
+    assert len(videos) == 1, f"expected one composited layer, found {videos}"
+    return videos[0]
+
+
+def _frames(video: Path, out_dir: Path) -> list[bytes]:
+    """Every frame of ``video``, as raw RGBA bytes, in order."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ff.run_ffmpeg(["-y", "-i", str(video), "-fps_mode", "passthrough",
+                   str(out_dir / "f_%05d.png")])
+    frames = []
+    for path in sorted(out_dir.glob("f_*.png")):
+        with Image.open(path) as handle:
+            frames.append(handle.convert("RGBA").tobytes())
+    return frames
+
+
+def _rgba(path: Path) -> bytes:
+    with Image.open(path) as handle:
+        return handle.convert("RGBA").tobytes()
+
+
+def test_state_frames_land_where_the_old_per_state_overlay_gate_did():
+    """``enable='between(t,start,end)'`` showed a state from ``ceil(start*fps)``."""
+    spans = [(0.0, 0.5), (0.5, 2.053991), (2.053991, 3.807982), (3.807982, 12.227)]
+    assert texts.state_frames(spans, fps=30, duration=12.227) == [0, 15, 62, 115, 368]
+    # a boundary that is a whole number of frames is not pushed onto the next one
+    assert texts.state_frames([(0.0, 1.0), (1.0, 2.0)], fps=12, duration=2.0) == [0, 12, 25]
+    # two states that fall inside one frame collapse rather than going backwards
+    # (the second used to win the overlay anyway, being the higher layer)
+    edges = texts.state_frames([(0.0, 0.42), (0.42, 0.5), (0.5, 3.0)], fps=12, duration=3.0)
+    assert edges == [0, 6, 6, 37]
+
+
+def test_the_concat_list_places_every_cut_on_a_whole_frame(env, spy: RenderSpy):
+    """The timing guarantee, in the file ffmpeg is actually handed."""
+    result = run(script=typed_script())
+    timeline = spy.timeline
+
+    spans = [(s["start"], s["end"]) for s in result.metadata["state_timings"]]
+    edges = texts.state_frames(spans, fps=env.fps, duration=timeline.duration)
+    expected = [
+        (edges[i + 1] - edges[i]) / texts.CONCAT_TICK_RATE
+        for i in range(len(spans)) if edges[i + 1] > edges[i]
+    ]
+    assert _concat_durations(env.work_dir) == pytest.approx(expected, abs=1e-9)
+
+    video = _state_video(env.work_dir)
+    assert video.exists() and video.stat().st_size > 0
+    assert Path(chat_layers(timeline)[0].src) == video
+    info = ff.probe(video)
+    assert info.has_video and not info.has_audio
+    assert (info.width, info.height) == (env.width, env.height)
+    # the layer covers the whole timeline, never a frame short of it
+    assert info.duration >= timeline.duration
+    assert info.duration < timeline.duration + 2.0 / env.fps
+
+
+def test_the_composited_layer_cuts_on_exactly_the_frames_the_clock_asked_for(env, tmp_path: Path):
+    """Not "close": every state's artwork lands on its own frame, to the frame.
+
+    Composition must not move a bubble even one frame away from the voice that
+    starts with it, so the frame each state appears on is compared against the
+    frame the per-state overlay gate produced, not against a tolerance.
+    """
+    result = run(script=typed_script())
+    frames = _frames(_state_video(env.work_dir), tmp_path / "composite")
+    stills = sorted(env.work_dir.rglob("states/chat_*.png"))
+
+    spans = [(s["start"], s["end"]) for s in result.metadata["state_timings"]]
+    edges = texts.state_frames(
+        spans, fps=env.fps, duration=result.metadata["timeline_seconds"]
+    )
+    assert len(stills) == len(spans)
+    assert len(frames) >= edges[-1] - 1
+    for position, still in enumerate(stills):
+        if edges[position + 1] <= edges[position]:
+            continue
+        wanted = _rgba(still)
+        first = next((i for i, frame in enumerate(frames) if frame == wanted), None)
+        assert first == edges[position], (
+            f"state {position} appears on frame {first}, not on frame {edges[position]} "
+            f"(t={spans[position][0]:.6f}s at {env.fps}fps)"
+        )
+
+
+def test_the_video_opens_on_the_chat_chrome_and_not_a_bare_background(env, tmp_path: Path):
+    """The blank-open defect, checked on the rendered pixels.
+
+    State 0 is the header-only frame; it has to be composited over the very
+    first frame of the finished mp4, not left until the first bubble lands.
+    """
+    result = run(script=typed_script())
+    header = sorted(env.work_dir.rglob("states/chat_*.png"))[0]
+
+    spans = result.metadata["state_timings"]
+    assert spans[0]["visible"] == 0 and spans[0]["start"] == 0.0
+    assert spans[0]["end"] == pytest.approx(0.5), "held until the first bubble"
+
+    # a pixel the header paints solidly, with a solid 5x5 neighbourhood so
+    # chroma subsampling in the mp4 cannot move it
+    with Image.open(header) as handle:
+        art = handle.convert("RGBA")
+    pixels = art.load()
+    spot = None
+    for y in range(2, art.height - 2):
+        for x in range(2, art.width - 2):
+            block = {pixels[x + dx, y + dy] for dx in (-2, 0, 2) for dy in (-2, 0, 2)}
+            if len(block) == 1 and next(iter(block))[3] == 255:
+                spot = (x, y, next(iter(block))[:3])
+                break
+        if spot:
+            break
+    assert spot is not None, "the header state paints nothing at all"
+
+    x, y, colour = spot
+    first_frame = tmp_path / "open.png"
+    ff.run_ffmpeg(["-y", "-i", str(result.output), "-frames:v", "1", str(first_frame)])
+    with Image.open(first_frame) as handle:
+        got = handle.convert("RGB").load()[x, y]
+    assert max(abs(a - b) for a, b in zip(got, colour, strict=True)) <= 24, (
+        f"the first frame shows {got} at {(x, y)} where the chat header paints {colour}"
+    )
+
+
+# --------------------------------------------------------------------------- #
 # generated conversations
 # --------------------------------------------------------------------------- #
 
@@ -333,8 +583,9 @@ def test_a_generated_conversation_renders_and_names_its_provider(env, spy: Rende
     assert any(m["typing"] > 0 for m in script_data["messages"]), "the generator adds typing beats"
 
     layers = chat_layers(spy.timeline)
-    assert len(layers) == result.metadata["states"] > 4, "typing beats add extra states"
-    assert layers[-1].end == pytest.approx(spy.timeline.duration)
+    assert len(layers) == 1, "the conversation is pre-composited into one layer"
+    assert result.metadata["states"] > 5, "the header and the typing beats add extra states"
+    assert layers[0].end == pytest.approx(spy.timeline.duration)
     assert _probe(result).has_video
 
 
@@ -447,7 +698,8 @@ def test_a_conversation_nobody_reads_aloud_still_renders(env, spy: RenderSpy):
     assert timeline.validate() == []
     assert result.metadata["spoken_messages"] == 0
     assert result.transcript is None
-    assert len(chat_layers(timeline)) == result.metadata["states"]
+    assert len(chat_layers(timeline)) == 1
+    assert len(result.metadata["state_timings"]) == result.metadata["states"]
     assert _probe(result).has_video
 
 

@@ -488,6 +488,94 @@ def test_layer_audio_is_taken_from_the_visual_input(tmp_path: Path, vid: Path, s
 
 
 # --------------------------------------------------------------------------- #
+# loudness normalisation (graph)
+# --------------------------------------------------------------------------- #
+
+#: The mix tail exactly as it looked before loudness normalisation existed.
+LEGACY_TAIL = (
+    "apad,atrim=duration=4,asetpts=PTS-STARTPTS,"
+    "alimiter=limit=0.95:level=0,aresample=async=1,"
+    "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[aout]"
+)
+
+
+def test_mix_is_loudness_normalised_between_the_mix_and_the_limiter(
+    tmp_path: Path, vid: Path, snd: Path
+):
+    tl = basic(vid)
+    tl.add_audio(AudioTrack(src=str(snd), role="voice"))
+    tl.add_audio(AudioTrack(src=str(snd), role="music"))
+    chain = chain_with(build_command(tl, tmp_path / "out.mp4"), "amix=")
+
+    assert "loudnorm=I=-14:TP=-1.5:LRA=11" in chain
+    # after the mix so it measures the whole programme, before the limiter so
+    # the limiter stays the last thing to touch the samples
+    assert chain.index("amix=") < chain.index("loudnorm=") < chain.index("alimiter")
+
+
+def test_loudness_target_none_reproduces_the_un_normalised_command(
+    tmp_path: Path, vid: Path, snd: Path
+):
+    tl = basic(vid)
+    tl.add_audio(AudioTrack(src=str(snd), role="voice"))
+    tl.add_audio(AudioTrack(src=str(snd), role="music"))
+    cmd = build_command(tl, tmp_path / "out.mp4", loudness_target=None)
+    chain = chain_with(cmd, "amix=")
+
+    assert "loudnorm" not in graph_of(cmd)
+    assert chain == "[a0][a1]amix=inputs=2:normalize=0:dropout_transition=0," + LEGACY_TAIL
+
+
+def test_loudness_target_comes_from_render_options(tmp_path: Path, vid: Path, snd: Path):
+    tl = basic(vid)
+    tl.add_audio(AudioTrack(src=str(snd), role="voice"))
+
+    opts = RenderOptions()
+    opts.loudness_target = -16.5
+    assert "loudnorm=I=-16.5:TP=-1.5:LRA=11" in graph_of(build_command(tl, tmp_path / "a.mp4",
+                                                                      options=opts))
+
+    off = RenderOptions()
+    off.loudness_target = None
+    assert "loudnorm" not in graph_of(build_command(tl, tmp_path / "b.mp4", options=off))
+
+    # the explicit argument wins over the option
+    assert "loudnorm=I=-20" in graph_of(
+        build_command(tl, tmp_path / "c.mp4", options=off, loudness_target=-20.0)
+    )
+
+
+def test_loudness_target_outside_the_loudnorm_range_is_rejected(tmp_path: Path, vid: Path,
+                                                                snd: Path):
+    tl = basic(vid)
+    tl.add_audio(AudioTrack(src=str(snd), role="voice"))
+    with pytest.raises(RenderError) as excinfo:
+        build_command(tl, tmp_path / "out.mp4", loudness_target=0.0)
+    assert any("loudness_target" in problem for problem in excinfo.value.problems)
+
+
+def test_a_silent_timeline_is_not_loudness_normalised(tmp_path: Path, vid: Path):
+    """Nothing to normalise on the ``anullsrc`` path -- and nothing to amplify."""
+    graph = graph_of(build_command(basic(vid), tmp_path / "out.mp4"))
+    assert "anullsrc" in graph and "loudnorm" not in graph
+
+
+def test_a_programme_too_short_for_loudnorm_skips_it(tmp_path: Path, vid: Path, snd: Path):
+    """Under three seconds ``loudnorm,alimiter`` returns below-gate audio at
+    full scale (ffmpeg 6.1), so the graph must not reach for it."""
+    from aiclipper.render import LOUDNESS_MIN_DURATION
+
+    assert LOUDNESS_MIN_DURATION == 3.0
+    for duration, normalised in ((2.5, False), (2.999, False), (3.0, True), (6.0, True)):
+        tl = Timeline(width=320, height=568, fps=30, duration=duration)
+        tl.add_visual(VisualLayer(kind="video", src=str(vid)))
+        tl.add_audio(AudioTrack(src=str(snd), role="voice"))
+        graph = graph_of(build_command(tl, tmp_path / "out.mp4"))
+        assert ("loudnorm" in graph) is normalised, duration
+        assert "alimiter" in graph          # the limiter is never skipped
+
+
+# --------------------------------------------------------------------------- #
 # subtitles and output options
 # --------------------------------------------------------------------------- #
 
@@ -759,9 +847,11 @@ def test_public_api_matches_the_contract():
     assert set(mod.__all__) == {"render", "build_command"}
 
     sig = inspect.signature(mod.render)
-    assert list(sig.parameters) == ["timeline", "out_path", "options", "settings", "log_path", "dry_run"]
+    assert list(sig.parameters) == [
+        "timeline", "out_path", "options", "settings", "log_path", "dry_run", "loudness_target",
+    ]
     assert sig.parameters["timeline"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
-    for name in ("options", "settings", "log_path", "dry_run"):
+    for name in ("options", "settings", "log_path", "dry_run", "loudness_target"):
         assert sig.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY, name
     assert sig.parameters["options"].default is None
     assert sig.parameters["settings"].default is None
@@ -769,10 +859,14 @@ def test_public_api_matches_the_contract():
     assert sig.parameters["dry_run"].default is False
 
     sig = inspect.signature(mod.build_command)
-    assert list(sig.parameters) == ["timeline", "out_path", "options", "settings", "workdir"]
-    for name in ("options", "settings", "workdir"):
+    assert list(sig.parameters) == ["timeline", "out_path", "options", "settings", "workdir",
+                                    "loudness_target"]
+    for name in ("options", "settings", "workdir", "loudness_target"):
         assert sig.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY, name
+    for name in ("options", "settings", "workdir"):
         assert sig.parameters[name].default is None
+    # the added argument defaults to "ask ``options``", so existing callers are unaffected
+    assert sig.parameters["loudness_target"].default is mod.UNSET
 
 
 def test_render_returns_a_render_result(tmp_path: Path, vid: Path):
@@ -1009,3 +1103,184 @@ def test_render_burns_subtitles_from_an_awkward_path_with_a_fonts_dir(tmp_path: 
     after = frame_at(out, 1.5, tmp_path / "sub1.png").crop((0, 440, 320, 540))
     assert during.convert("L").getextrema()[1] > 180, "no glyphs were burned in"
     assert after.convert("L").getextrema()[1] < 40, "the cue outlived its window"
+
+
+# --------------------------------------------------------------------------- #
+# loudness normalisation (real renders, measured with ebur128)
+# --------------------------------------------------------------------------- #
+
+def loudness(path: Path) -> tuple[float, float]:
+    """``(integrated LUFS, true peak dBFS)`` of a rendered file, via ``ebur128``.
+
+    ebur128 gates at -70 LUFS absolute, so a silent file reports exactly
+    ``-70.0`` with a ``-inf`` peak: that pair *is* the signature of digital
+    silence.
+    """
+    proc = ff.run_ffmpeg(
+        ["-i", str(path), "-filter_complex", "ebur128=peak=true", "-f", "null", "-"],
+        quiet=False,
+    )
+    summary = proc.stderr[proc.stderr.rfind("Integrated loudness"):]
+
+    def grab(pattern: str) -> float:
+        match = re.search(pattern, summary)
+        assert match, summary
+        return float("-inf") if "inf" in match.group(1) else float(match.group(1))
+
+    return grab(r"I:\s+(-inf|-?[\d.]+) LUFS"), grab(r"Peak:\s+(-inf|-?[\d.]+) dBFS")
+
+
+@pytest.fixture
+def quiet_mix(tmp_path: Path, make_video, make_audio):
+    """Factory for the kind of mix every workflow builds: narration over a bed."""
+    bg = make_video("bg.mp4", seconds=3.0, width=160, height=120, fps=12, audio=False)
+    voice = make_audio("voice.wav", seconds=3.0, frequency=420.0)
+    bed = make_audio("bed.wav", seconds=3.0, frequency=180.0)
+
+    def _make() -> Timeline:
+        tl = Timeline(width=320, height=568, fps=12, duration=3.0)
+        tl.add_visual(VisualLayer(kind="video", src=str(bg), loop=True, fit="cover"))
+        tl.add_audio(AudioTrack(src=str(voice), role="voice"))
+        tl.add_audio(AudioTrack(src=str(bed), role="music", gain_db=-8.0))
+        return tl
+
+    return _make
+
+
+@pytest.mark.needs_ffmpeg
+def test_render_lands_on_the_loudness_target(tmp_path: Path, quiet_mix):
+    """The defect: the raw mix exports around -34 LUFS, ~20 LU below platform level."""
+    before_path, after_path = tmp_path / "raw.mp4", tmp_path / "normalised.mp4"
+    render(quiet_mix(), before_path, options=FAST, loudness_target=None)
+    render(quiet_mix(), after_path, options=FAST)
+
+    before, _ = loudness(before_path)
+    after, peak = loudness(after_path)
+
+    assert before < -25.0, f"the un-normalised mix was expected to be quiet, got {before}"
+    assert abs(after + 14.0) <= 1.5, f"integrated loudness {after} LUFS is not near -14"
+    assert after - before > 10.0
+    assert peak < 0.0, f"true peak {peak} dBFS clips"
+
+
+@pytest.mark.needs_ffmpeg
+def test_normalised_output_does_not_clip(tmp_path: Path, make_video):
+    """A deliberately hot source: the limiter downstream of loudnorm holds the ceiling."""
+    bg = make_video("bg.mp4", seconds=3.5, width=160, height=120, fps=12, audio=False)
+    hot = tmp_path / "hot.wav"
+    ff.run_ffmpeg(["-y", "-f", "lavfi", "-i", "sine=frequency=300:duration=3.5",
+                   "-af", "volume=4", "-c:a", "pcm_s16le", str(hot)])
+    out = tmp_path / "hot.mp4"
+
+    tl = Timeline(width=320, height=568, fps=12, duration=3.5)
+    tl.add_visual(VisualLayer(kind="video", src=str(bg), fit="cover"))
+    tl.add_audio(AudioTrack(src=str(hot), role="voice"))
+    render(tl, out, options=FAST)
+
+    integrated, peak = loudness(out)
+    assert peak <= -0.5, f"true peak {peak} dBFS leaves no headroom"
+    assert mean_volume(out, 0.2, 3.0) < 0.0
+    assert integrated <= -12.0, f"normalisation overshot upward: {integrated} LUFS"
+
+
+@pytest.mark.needs_ffmpeg
+def test_loudness_normalisation_leaves_digital_silence_silent(tmp_path: Path, make_video):
+    """loudnorm's -70 LUFS absolute gate is what keeps a silent track silent."""
+    bg = make_video("bg.mp4", seconds=3.5, width=160, height=120, fps=12, audio=False)
+    silent = ff.make_silence(3.5, tmp_path / "narration.wav")
+    out = tmp_path / "silent.mp4"
+
+    tl = Timeline(width=320, height=568, fps=12, duration=3.5)
+    tl.add_visual(VisualLayer(kind="video", src=str(bg), fit="cover"))
+    tl.add_audio(AudioTrack(src=str(silent), role="voice"))
+    render(tl, out, options=FAST)
+
+    integrated, peak = loudness(out)
+    assert integrated <= -70.0, f"silence was amplified to {integrated} LUFS"
+    assert peak == float("-inf") or peak < -80.0
+    assert mean_volume(out, 0.2, 3.0) < -80.0
+
+
+@pytest.mark.needs_ffmpeg
+def test_loudness_normalisation_does_not_lift_an_inaudible_track_into_hiss(
+    tmp_path: Path, make_video
+):
+    """A -60 dBFS track is below the gate too: it stays inaudible instead of
+    being hauled up 50 dB into a wall of noise."""
+    bg = make_video("bg.mp4", seconds=3.5, width=160, height=120, fps=12, audio=False)
+    whisper = tmp_path / "whisper.wav"
+    ff.run_ffmpeg(["-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=3.5",
+                   "-af", "volume=-60dB", "-c:a", "pcm_s16le", str(whisper)])
+    out = tmp_path / "whisper.mp4"
+
+    tl = Timeline(width=320, height=568, fps=12, duration=3.5)
+    tl.add_visual(VisualLayer(kind="video", src=str(bg), fit="cover"))
+    tl.add_audio(AudioTrack(src=str(whisper), role="voice"))
+    render(tl, out, options=FAST)
+
+    integrated, _ = loudness(out)
+    assert integrated <= -70.0, f"an inaudible track was normalised up to {integrated} LUFS"
+    assert mean_volume(out, 0.2, 3.0) < -70.0
+
+
+@pytest.mark.needs_ffmpeg
+def test_split_narration_routing_is_fine_the_offline_tts_is_just_silent(
+    tmp_path: Path, make_video
+):
+    """Settles the audit's "-70 LUFS split render" finding: not a routing bug.
+
+    The same two-pane timeline is rendered twice, with only the narration file
+    swapped.  The filter graph is byte-identical, so the routing cannot differ;
+    ``ffmpeg.make_silence`` -- exactly what ``tts/offline.py`` writes in the
+    sandbox -- reaches the mix as digital silence, while an audible tone in the
+    very same slot reaches the output on target.
+    """
+    top = make_video("top.mp4", seconds=3.5, width=160, height=120, fps=12, audio=False)
+    bottom = make_video("bottom.mp4", seconds=3.5, width=160, height=120, fps=12, audio=False)
+    offline = ff.make_silence(3.5, tmp_path / "offline-tts.wav")     # what tts/offline.py writes
+    audible = ff.make_tone(3.5, tmp_path / "real-voice.wav", frequency=320.0, volume=0.25)
+
+    def split(narration: Path) -> Timeline:
+        tl = Timeline(width=320, height=568, fps=12, duration=3.5)
+        tl.add_visual(VisualLayer(kind="video", src=str(top), x=0, y=0, w=320, h=284,
+                                  fit="cover", z=0))
+        tl.add_visual(VisualLayer(kind="video", src=str(bottom), x=0, y=284, w=320, h=284,
+                                  fit="cover", z=1))
+        tl.add_audio(AudioTrack(src=str(narration), role="voice"))
+        return tl
+
+    silent_out, audible_out = tmp_path / "offline.mp4", tmp_path / "audible.mp4"
+    silent_cmd = render(split(offline), silent_out, options=FAST).command
+    audible_cmd = render(split(audible), audible_out, options=FAST).command
+
+    # identical routing: the graphs differ only in which narration file is read
+    assert graph_of(silent_cmd) == graph_of(audible_cmd)
+    assert "[2:a]" in graph_of(silent_cmd) and "amix=inputs=1" in graph_of(silent_cmd)
+
+    quiet_i, quiet_peak = loudness(silent_out)
+    loud_i, _ = loudness(audible_out)
+    assert quiet_i <= -70.0 and quiet_peak == float("-inf")   # the offline provider, not routing
+    assert abs(loud_i + 14.0) <= 1.5, f"the narration bus is broken: {loud_i} LUFS"
+
+
+@pytest.mark.needs_ffmpeg
+def test_a_short_silent_render_is_not_blasted_to_full_scale(tmp_path: Path, make_video):
+    """The reason :data:`LOUDNESS_MIN_DURATION` exists.
+
+    ffmpeg 6.1's ``loudnorm,alimiter`` pair hands back below-gate audio at
+    about 0 dBFS when the programme is shorter than three seconds -- a silent
+    2s render would come out as a full-scale blast.  The renderer skips
+    normalisation there instead.
+    """
+    bg = make_video("bg.mp4", seconds=2.0, width=160, height=120, fps=12, audio=False)
+    silent = ff.make_silence(2.0, tmp_path / "narration.wav")
+    out = tmp_path / "short.mp4"
+
+    tl = Timeline(width=320, height=568, fps=12, duration=2.0)
+    tl.add_visual(VisualLayer(kind="video", src=str(bg), fit="cover"))
+    tl.add_audio(AudioTrack(src=str(silent), role="voice"))
+    result = render(tl, out, options=FAST)
+
+    assert mean_volume(out, 0.1, 1.8) < -80.0, "a silent short render came out loud"
+    assert loudness(out)[1] == float("-inf")
+    assert "loudnorm" not in graph_of(result.command)

@@ -25,8 +25,19 @@
       return value.slice(0, limit).replace(/[\s.,;:]+$/, "") + "…";
     }
 
+    function applyTheme(vars) {
+      // The theme lives in aiclipper.overlays.THEMES; Python resolves it against
+      // this canvas and hands us the finished pixel values, so the browser and
+      // the Pillow backend cannot drift apart.
+      var root = document.documentElement.style;
+      Object.keys(vars || {}).forEach(function (name) {
+        root.setProperty(name, String(vars[name]));
+      });
+    }
+
     window.__forumRender = function (data) {
       data = data || {};
+      applyTheme(data.vars);
       document.body.setAttribute("data-theme", data.theme || "dark");
       document.getElementById("badge").textContent = data.badge || "";
       document.getElementById("community").textContent = data.community || "";

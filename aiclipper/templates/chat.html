@@ -10,7 +10,7 @@
 </div>
 <script>
   (function () {
-    var DATA = { contact: "", initials: "", theme: "classic", messages: [] };
+    var DATA = { contact: "", initials: "", theme: "classic", vars: {}, messages: [] };
 
     function el(tag, cls, text) {
       var node = document.createElement(tag);
@@ -34,8 +34,19 @@
       return row;
     }
 
+    function applyTheme(vars) {
+      // The theme lives in aiclipper.overlays.THEMES; Python resolves it against
+      // this canvas and hands us the finished pixel values, so the browser and
+      // the Pillow backend cannot drift apart.
+      var root = document.documentElement.style;
+      Object.keys(vars || {}).forEach(function (name) {
+        root.setProperty(name, String(vars[name]));
+      });
+    }
+
     window.__chatInit = function (data) {
       DATA = data || DATA;
+      applyTheme(DATA.vars);
       document.body.setAttribute("data-theme", DATA.theme || "classic");
       document.getElementById("avatar").textContent = DATA.initials || "";
       document.getElementById("contact").textContent = DATA.contact || "";

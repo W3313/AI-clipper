@@ -673,3 +673,85 @@ def test_write_chat_clamps_degenerate_turn_counts(turns):
     chat = sg.write_chat("a locked door", turns=turns, settings=seeded(3))
     assert len(chat.messages) == 2
     assert chat.messages[0].outgoing != chat.messages[1].outgoing
+
+
+# --------------------------------------------------------------------------- #
+# the prompt's own wording never becomes content
+# --------------------------------------------------------------------------- #
+
+#: Wording that can only have come from our own prompt scaffolding.
+INSTRUCTION_VOCABULARY = (
+    "vertical short", "spoken narration", "call to action", "punchy tone",
+    "text-message story", "forum story post", "words in the body",
+    "premise:", "topic:", "write a", "-second",
+)
+
+#: Topics too thin to out-weigh the instructions wrapped around them.
+THIN_TOPICS = ["cats", "tiny things", "\U0001f431", "ok", "the parcel " * 400]
+
+
+def _instruction_leaks(text: str) -> list[str]:
+    low = (text or "").lower()
+    return [phrase for phrase in INSTRUCTION_VOCABULARY if phrase in low]
+
+
+@pytest.mark.parametrize("topic", THIN_TOPICS, ids=range(len(THIN_TOPICS)))
+def test_offline_output_never_echoes_the_prompt_instructions(topic):
+    """The title becomes the output filename, so a leak here is visible on disk."""
+    script = sg.write_script(topic, seconds=10, settings=seeded(4))
+    chat = sg.write_chat(topic, turns=6, settings=seeded(4))
+    post = sg.write_reddit(topic, words=60, settings=seeded(4))
+
+    assert _instruction_leaks(script.title) == [], script.title
+    assert _instruction_leaks(chat.title) == [], chat.title
+    assert _instruction_leaks(post.title) == [], post.title
+    # ...and the rest of the copy is clean too, not only the titles.
+    assert _instruction_leaks(f"{script.hook} {script.narration}") == []
+    assert _instruction_leaks(" ".join(m.text for m in chat.messages)) == []
+    assert _instruction_leaks(post.body) == []
+
+
+@pytest.mark.parametrize(
+    ("topic", "expected"),
+    [("cats", ("cats",)), ("tiny things", ("tiny", "things")), ("otters", ("otters",))],
+)
+def test_offline_titles_are_about_the_topic(topic, expected):
+    """Low-information topics still have to name the thing they are about."""
+    titles = [
+        sg.write_script(topic, seconds=10, settings=seeded(4)).title,
+        sg.write_chat(topic, turns=6, settings=seeded(4)).title,
+        sg.write_reddit(topic, words=60, settings=seeded(4)).title,
+    ]
+    for title in titles:
+        assert any(word in title.lower() for word in expected), title
+
+
+def test_a_model_title_that_echoes_our_instructions_is_replaced():
+    """The guard that already covers hooks, beats and messages covers titles too."""
+    echo = "Write a 30-second vertical short in a punchy tone"
+    script = sg.write_script(
+        "sourdough", seconds=30, settings=seeded(7),
+        provider=FakeProvider(dict(GOOD_SCRIPT_PAYLOAD, title=echo)),
+    )
+    chat = sg.write_chat(
+        "sourdough", turns=4, settings=seeded(7),
+        provider=FakeProvider(dict(GOOD_CHAT_PAYLOAD, title="Write a text-message story")),
+    )
+    post = sg.write_reddit(
+        "sourdough", words=60, settings=seeded(7),
+        provider=FakeProvider(dict(GOOD_FORUM_PAYLOAD, title="Write a forum story post")),
+    )
+    for title in (script.title, chat.title, post.title):
+        assert _instruction_leaks(title) == [], title
+        assert "sourdough" in title.lower(), title
+    # the rest of a good payload is still used
+    assert script.hook == GOOD_SCRIPT_PAYLOAD["hook"]
+    assert "my key did not turn" in post.body
+
+
+def test_the_subject_reaches_the_provider_tagged():
+    provider = FakeProvider(GOOD_SCRIPT_PAYLOAD)
+    sg.write_script("bread ovens", seconds=30, provider=provider, settings=seeded(5))
+    prompt, _schema, _system = provider.calls[0]
+    assert "bread ovens" in prompt
+    assert "[subject]" in prompt and "[/subject]" in prompt

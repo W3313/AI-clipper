@@ -17,13 +17,16 @@ The order of work:
    changes from message to message.
 3. :func:`plan_beats` walks the conversation and puts it on a clock (below).
 4. :func:`aiclipper.overlays.render_chat` renders one transparent PNG per
-   conversation *state*, and :func:`state_spans` maps those states onto the
-   clock -- using each :class:`~aiclipper.overlays.ChatState`'s own ``visible``
-   and ``typing`` fields rather than re-deriving the order, so a typing frame
-   can never be mistaken for a bubble frame.
-5. One :class:`~aiclipper.models.Timeline`: the background, one image layer per
-   state covering exactly that state's span, one voice track per message at its
-   own offset, and a ducked music bed.
+   conversation *state* -- including a leading header-only state, so the video
+   never opens on a bare background -- and :func:`state_spans` maps those states
+   onto the clock, using each :class:`~aiclipper.overlays.ChatState`'s own
+   ``visible`` and ``typing`` fields rather than re-deriving the order, so a
+   typing frame can never be mistaken for a bubble frame.
+5. :func:`compose_states` flattens those stills into **one** alpha video whose
+   cuts land exactly on the span boundaries.
+6. One :class:`~aiclipper.models.Timeline`: the background, that single
+   conversation layer, one voice track per message at its own offset, and a
+   ducked music bed.
 
 **The clock.**  Walking the messages, for each one in turn:
 
@@ -36,7 +39,22 @@ The order of work:
 So the state for message *i* is visible from the moment it appears until the
 state for message *i + 1* appears -- through the next message's delay and typing
 beat -- and the last state stays up until the end of the video, which is the
-last narration's end plus :data:`TAIL_SECONDS` of air.
+last narration's end plus :data:`TAIL_SECONDS` of air.  Before all of that, the
+header-only state holds from ``t=0`` until the first message's own state lands.
+
+**One layer, not one per state.**  Overlaying a full-canvas RGBA still per state
+made the render cost grow with the message count: every layer is another
+``scale``/``pad``/``overlay`` the graph runs on *every* frame of the video, so a
+ten-message chat spent about three times its own running length in ffmpeg and a
+thirty-message one ran into double-digit minutes.  :func:`compose_states`
+therefore pre-composites the states into a single intermediate video in the
+workspace -- an ffmpeg ``concat`` list of the state PNGs with one ``duration``
+directive per span, encoded with an alpha-preserving lossless codec -- and the
+timeline carries that one layer.  Every cut is placed on the frame the old
+per-state ``enable`` gate switched on, so a render comes out frame for frame
+what it always did and bubble-to-voice sync is untouched; what changes is that
+the filter graph is now the same size for a two-message chat and a fifty-message
+one.
 
 Nothing here imports an optional third-party dependency at module scope and
 nothing here touches the network: with the heuristic LLM provider, the offline
@@ -47,12 +65,14 @@ container with no egress.
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from .. import assets as assets_module
+from .. import ffmpeg as ff
 from .. import overlays as overlays_module
 from .. import render as render_module
 from .. import scriptgen, tts
@@ -91,6 +111,12 @@ __all__ = [
     "message_hold",
     "plan_beats",
     "state_spans",
+    "compose_states",
+    "state_frames",
+    "FRAME_EPSILON",
+    "STATE_VIDEO_NAME",
+    "STATE_VIDEO_CODECS",
+    "CONCAT_TICK_RATE",
     "run",
 ]
 
@@ -121,6 +147,19 @@ CAPTION_MIN_MARGIN_V = 90
 #: Presets cap a group at a handful of words, but a big uppercase face puts each
 #: of them on its own line, so three is the working worst case.
 CAPTION_LINES = 3
+
+#: Name of the pre-composited conversation layer inside the workspace.
+STATE_VIDEO_NAME = "chat_states.mov"
+
+#: Codecs tried, in order, for that layer: each one is lossless *and* keeps the
+#: alpha channel the states are drawn with.  ``qtrle`` is the cheapest by a wide
+#: margin here -- the frames only change at a state boundary and it skips
+#: unchanged scanlines -- so it is what a normal build ends up using.
+STATE_VIDEO_CODECS: tuple[tuple[str, str, str], ...] = (
+    ("qtrle", "argb", ".mov"),
+    ("png", "rgba", ".mov"),
+    ("ffv1", "rgba", ".mkv"),
+)
 
 #: Catalogue voices used when the caller names none: two clearly different
 #: reads, so the two sides of the conversation never sound like one person.
@@ -225,30 +264,52 @@ def state_spans(
 ) -> list[tuple[float, float]]:
     """Map every overlay state onto ``[start, end)`` on the clock.
 
-    The states come from :func:`aiclipper.overlays.chat_states`, the same list
-    :func:`~aiclipper.overlays.render_chat` renders, and each one is placed from
-    its *own* fields: a typing state (``visible=i``) appears at beat ``i``'s
-    ``typing_start``, and a bubble state (``visible=i+1``) appears at beat
-    ``i``'s ``start``.  Each span runs until the next state appears, and the last
-    one runs to ``total`` -- so the spans are contiguous, never overlap and cover
-    everything from the first state to the end of the video.
+    The states come from :func:`aiclipper.overlays.chat_states` -- the same list
+    :func:`~aiclipper.overlays.render_chat` renders, and asked for with the same
+    ``header_state=True`` -- and each one is placed from its *own* fields, never
+    from its position in the list:
+
+    * the header state (``visible=0``, ``typing`` false) starts at ``0.0``, so
+      the chat chrome is on screen from the very first frame instead of the
+      video opening on a bare background while message 0 waits out its delay;
+    * a typing state (``visible=i``, ``typing`` true) appears at beat ``i``'s
+      ``typing_start``;
+    * a bubble state (``visible=i+1``) appears at beat ``i``'s ``start``.
+
+    Each span runs until the next state appears and the last one runs to
+    ``total``, so the spans are contiguous, never overlap and cover the whole
+    video from ``0.0``.  A span may be empty -- the header's, when the first
+    message has no delay and no typing beat and so lands at ``t=0``; a typing
+    frame's, when the hint is shorter than the gap the clock rounds to.  An
+    empty span simply contributes no frames to the composited layer; it is
+    never widened at the expense of the state that follows it.
     """
-    states = overlays_module.chat_states(script)
+    states = overlays_module.chat_states(script, header_state=True)
     starts: list[float] = []
     for state in states:
         if state.typing:
             beat = beats[state.visible]
             starts.append(beat.start if beat.typing_start is None else beat.typing_start)
+        elif state.visible == 0:
+            starts.append(0.0)
         else:
             starts.append(beats[state.visible - 1].start)
 
     spans: list[tuple[float, float]] = []
     for position, begin in enumerate(starts):
         if position + 1 < len(starts):
-            end = starts[position + 1]
+            # A state gives way the instant the next one appears.  Padding a
+            # short one out to MIN_STATE_SECONDS here would make it overlap its
+            # own successor -- which a typing hint under a tenth of a second,
+            # or a header with no room, really does -- and it could not buy the
+            # state any screen time anyway: :func:`state_frames` places every
+            # cut from the *starts* alone, so the floor would only ever be a
+            # lie in the metadata.  MIN_STATE_SECONDS is therefore the floor of
+            # the last span, which is the only one with room to grow into.
+            end = max(starts[position + 1], begin)
         else:
             end = max(float(total), begin + MIN_STATE_SECONDS)
-        spans.append((begin, max(end, begin + MIN_STATE_SECONDS)))
+        spans.append((begin, end))
     return spans
 
 
@@ -376,7 +437,12 @@ def _render_states(
     backend: str | None,
     settings: Settings,
 ) -> tuple[list[overlays_module.OverlayImage], str]:
-    """Render the conversation states and report the backend that drew them."""
+    """Render the conversation states and report the backend that drew them.
+
+    ``header_state=True`` matches :func:`state_spans`, which places the states by
+    their ``visible``/``typing`` fields: the two calls must always be given the
+    same value or the images and the spans stop describing the same list.
+    """
     available = overlays_module.available_backends(settings)
     chosen = (backend or "").strip().lower() or (available[0] if available else "pillow")
 
@@ -385,7 +451,8 @@ def _render_states(
     overlay_log.addHandler(watch)
     try:
         images = overlays_module.render_chat(
-            script, out_dir, width=width, height=height, settings=settings, backend=backend
+            script, out_dir, width=width, height=height, settings=settings, backend=backend,
+            header_state=True,
         )
     finally:
         overlay_log.removeHandler(watch)
@@ -501,20 +568,160 @@ def _synthesise(
     return results, paths, holds
 
 
-def _state_layer(
-    image: overlays_module.OverlayImage, start: float, end: float, *, width: int, height: int
-) -> VisualLayer:
-    """One conversation state, held over the canvas for exactly its span.
+#: The frame rate ffmpeg's image demuxer assumes for a still, and therefore the
+#: time base every timestamp in a ``concat`` list of stills is rounded to.  A
+#: boundary written in plain seconds is snapped to this grid -- 40ms, more than
+#: a frame at any sane output rate -- which puts some frames simply out of
+#: reach.  :func:`compose_states` works around it by writing every duration as a
+#: whole number of *these* ticks (which the grid represents exactly) and then
+#: rescaling the stream's timestamps to the real frame rate, so no boundary is
+#: ever rounded at all.
+CONCAT_TICK_RATE = 25
+
+#: Slack when turning a boundary time into a frame index.  The clock rounds its
+#: instants to microseconds, so a boundary that is a whole number of frames must
+#: not be pushed onto the next frame by a float error a thousand times smaller.
+FRAME_EPSILON = 1e-9
+
+
+def state_frames(
+    spans: Sequence[tuple[float, float]], *, fps: int, duration: float
+) -> list[int]:
+    """The frame each state first appears on, plus the frame the video ends on.
+
+    ``len(spans) + 1`` indices, non-decreasing.  A state that starts at ``t``
+    first appears on frame ``ceil(t * fps)`` -- the first frame whose own
+    timestamp is at or after ``t``, which is *exactly* the frame the renderer's
+    ``enable='between(t,start,end)'`` gate used to turn that state's own layer
+    on.  Pre-compositing therefore cuts on the same frames the per-state
+    overlays cut on, not a frame either side of them.
+
+    Two states that fall on the same frame (a typing beat shorter than one
+    frame) collapse: the second one used to win the overlay anyway, being the
+    higher layer.
+    """
+    rate = max(1, int(fps))
+    edges: list[int] = []
+    for begin, _ in spans:
+        frame = math.ceil(float(begin) * rate - FRAME_EPSILON)
+        edges.append(max(0, frame) if not edges else max(frame, edges[-1]))
+    tail = math.ceil(max(0.0, float(duration)) * rate - FRAME_EPSILON)
+    edges.append(max(tail, (edges[-1] if edges else 0)) + 1)
+    return edges
+
+
+def _concat_quote(path: Path) -> str:
+    """``path`` as the ffmpeg ``concat`` demuxer wants to read it back."""
+    text = str(path).replace("\\", "\\\\").replace("'", "'\\''")
+    return f"file '{text}'"
+
+
+def _state_codec(settings: Settings) -> tuple[str, str, str]:
+    """The first entry of :data:`STATE_VIDEO_CODECS` this ffmpeg can encode."""
+    for codec, pix_fmt, suffix in STATE_VIDEO_CODECS:
+        if ff.has_encoder(codec, settings):
+            return codec, pix_fmt, suffix
+    names = ", ".join(codec for codec, _, _ in STATE_VIDEO_CODECS)
+    raise AiclipperError(
+        f"this ffmpeg build has none of the lossless alpha encoders the chat layer needs ({names})"
+    )
+
+
+def compose_states(
+    images: Sequence[overlays_module.OverlayImage],
+    spans: Sequence[tuple[float, float]],
+    out_dir: Path,
+    *,
+    fps: int,
+    duration: float,
+    settings: Settings | None = None,
+) -> Path:
+    """Flatten the conversation states into one alpha video and return its path.
+
+    ``images[i]`` is held for exactly ``spans[i]``.  The stills go into an
+    ffmpeg ``concat`` list with one ``duration`` directive per span, and the
+    list is encoded once, at the timeline's ``fps``, with the first lossless
+    alpha codec the local ffmpeg has (see :data:`STATE_VIDEO_CODECS`).
+
+    **The cuts do not move.**  :func:`state_frames` turns every span boundary
+    into the frame the renderer's old per-state ``enable`` gate switched on, and
+    each duration is written as that many :data:`CONCAT_TICK_RATE` ticks -- the
+    only grid the demuxer represents exactly -- with the stream's timestamps
+    scaled back to real time on the way out.  A render therefore comes out frame
+    for frame identical to the one the stacked overlays produced.
+
+    This is what keeps the render cost flat.  One state per layer means one
+    full-canvas ``scale``/``pad``/``overlay`` per state running on *every* frame
+    of the finished video; one pre-composited layer is a single overlay whatever
+    the message count, and building it costs one cheap pass over the stills.
+
+    A span of zero length -- only ever the header's, when the first message
+    lands at ``t=0`` -- contributes no frames.  Raises
+    :class:`~aiclipper.errors.AiclipperError` when ``images`` and ``spans`` do
+    not describe the same states, or when there is nothing to compose.
+    """
+    s = _cfg(settings)
+    rate = max(1, int(fps))
+    total = max(0.0, float(duration))
+    if len(images) != len(spans):
+        raise AiclipperError(
+            f"{len(images)} conversation states but {len(spans)} spans to show them for"
+        )
+    paths = [Path(image.path) for image in images]
+
+    edges = state_frames(spans, fps=rate, duration=total)
+    entries: list[tuple[Path, float]] = []
+    for position, path in enumerate(paths):
+        frames = edges[position + 1] - edges[position]
+        if frames > 0:
+            entries.append((path, frames / CONCAT_TICK_RATE))
+    if not entries:
+        raise AiclipperError("the conversation has no state to show for any length of time")
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    codec, pix_fmt, suffix = _state_codec(s)
+    out_path = out_dir / (Path(STATE_VIDEO_NAME).stem + suffix)
+
+    lines = ["ffconcat version 1.0"]
+    for path, length in entries:
+        lines.append(_concat_quote(path))
+        lines.append(f"duration {length:.6f}")
+    # The concat demuxer honours the final ``duration`` only if another entry
+    # follows it; the repeat is trimmed away again by ``-t``.
+    lines.append(_concat_quote(entries[-1][0]))
+    list_path = out_dir / (Path(STATE_VIDEO_NAME).stem + ".concat")
+    list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # ``settb``/``setpts`` turn the tick grid the list was written on back into
+    # real time: a cut written at tick ``n`` lands on frame ``n``, exactly.
+    scale = f"format=rgba,settb=1/1000000,setpts=PTS*{CONCAT_TICK_RATE}/{rate},fps={rate}"
+    ff.run_ffmpeg(
+        [
+            "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
+            "-vf", scale, "-fps_mode", "cfr",
+            "-c:v", codec, "-pix_fmt", pix_fmt, "-an", "-t", f"{edges[-1] / rate:.6f}",
+            str(out_path),
+        ],
+        settings=s,
+    )
+    log.debug("texts: composited %d conversation states into %s (%s)",
+              len(entries), out_path.name, codec)
+    return out_path
+
+
+def _states_layer(src: Path, *, width: int, height: int, duration: float) -> VisualLayer:
+    """The whole conversation as one layer over the canvas.
 
     ``fit="contain"`` keeps the layer RGBA through the scale (the frames are
-    already canvas sized, so nothing is actually padded) and the renderer gates
-    it with ``enable='between(t,start,end)'``.
+    already canvas sized, so nothing is actually padded), which is what lets the
+    background show through everywhere the chat does not paint.
     """
     return VisualLayer(
-        kind="image",
-        src=str(image.path),
-        start=float(start),
-        end=float(end),
+        kind="video",
+        src=str(src),
+        start=0.0,
+        end=float(duration),
         x=0,
         y=0,
         w=int(width),
@@ -522,8 +729,8 @@ def _state_layer(
         fit="contain",
         opacity=1.0,
         take_audio=False,
-        z=image.index + 1,
-        label=f"chat:{image.index:03d}",
+        z=1,
+        label="chat:states",
     )
 
 
@@ -544,6 +751,26 @@ def _message_report(script: ChatScript, beats: Sequence[Beat], voices: Sequence[
             "voice": voices[beat.index] if beat.index < len(voices) else "",
         })
     return report
+
+
+def _state_report(script: ChatScript, spans: Sequence[tuple[float, float]]) -> list[dict]:
+    """Per-state spans, for :attr:`ProjectResult.metadata`.
+
+    Each entry carries the state's own ``visible``/``typing`` fields next to its
+    span, so a caller (or a test) can check the cuts in the composited layer
+    without re-deriving the order of the states.
+    """
+    states = overlays_module.chat_states(script, header_state=True)
+    return [
+        {
+            "index": state.index,
+            "visible": state.visible,
+            "typing": bool(state.typing),
+            "start": round(begin, 6),
+            "end": round(end, 6),
+        }
+        for state, (begin, end) in zip(states, spans, strict=True)
+    ]
 
 
 def run(
@@ -612,6 +839,9 @@ def run(
         raise AiclipperError(
             f"the overlay produced {len(images)} states but the clock has {len(spans)} spans"
         )
+    states_video = compose_states(
+        images, spans, work, fps=s.fps, duration=duration, settings=s
+    )
 
     spoken = [(r, b) for r, b in zip(results, beats, strict=True) if r is not None]
     words = common.narration_words(
@@ -628,8 +858,7 @@ def run(
         common.background_layer(background_asset, width=width, height=height,
                                 duration=duration, settings=s)
     )
-    for image, (begin, end) in zip(images, spans, strict=True):
-        timeline.add_visual(_state_layer(image, begin, end, width=width, height=height))
+    timeline.add_visual(_states_layer(states_video, width=width, height=height, duration=duration))
     for beat in beats:
         if beat.audio is not None:
             timeline.add_audio(
@@ -669,6 +898,8 @@ def run(
             "messages": len(chat.messages),
             "spoken_messages": sum(1 for b in beats if b.spoken),
             "states": len(spans),
+            "state_video": states_video.name,
+            "state_timings": _state_report(chat, spans),
             "voices": {
                 "outgoing": mine.voice_id or mine.provider,
                 "incoming": theirs.voice_id or theirs.provider,

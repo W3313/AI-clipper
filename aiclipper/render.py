@@ -16,6 +16,15 @@ Design rules that the rest of the package relies on:
   carry the timeline duration; ``-shortest`` is never used.
 * **Paths are escaped** with :func:`aiclipper.ffmpeg.escape_filter_path` before
   they enter the graph.
+* **The mix is loudness-normalised.**  A single-pass ``loudnorm`` aimed at
+  :data:`DEFAULT_LOUDNESS_TARGET` sits between ``amix`` and the limiter, so
+  every workflow exports at roughly the level short-form platforms normalise
+  to instead of the -33..-44 LUFS the raw mix lands at.  Programmes shorter
+  than :data:`LOUDNESS_MIN_DURATION` skip it (the filter misbehaves there).
+  Pass ``loudness_target=None`` -- to :func:`render`/:func:`build_command`, or
+  as a ``loudness_target`` attribute on
+  :class:`~aiclipper.models.RenderOptions` -- to switch it off and get the
+  un-normalised graph back verbatim.
 
 The command returned by :func:`build_command` includes the ffmpeg binary as
 element ``0`` so it is directly runnable/loggable; :func:`render` hands
@@ -63,6 +72,39 @@ _DUCK = "sidechaincompress=threshold=0.05:ratio=8:attack=20:release=300"
 _LIMITER = "alimiter=limit=0.95:level=0"
 _CROP_INSTANCE = "pan"
 
+#: Integrated loudness the finished file aims for, in LUFS.  Short-form
+#: platforms normalise playback to roughly -14 LUFS; anything quieter is turned
+#: up (or the viewer reaches for the volume), anything louder is turned down.
+DEFAULT_LOUDNESS_TARGET = -14.0
+
+#: Ceiling handed to ``loudnorm``.  It leaves headroom for the limiter that
+#: follows, so normalisation can never be the thing that clips.
+LOUDNESS_TRUE_PEAK = -1.5
+
+#: Target loudness *range*.  11 LU keeps a narration/music mix lively without
+#: letting ``loudnorm`` squash it flat.
+LOUDNESS_RANGE = 11.0
+
+#: ``loudnorm`` only accepts a target inside this window.
+_LOUDNESS_LIMITS = (-70.0, -5.0)
+
+#: Shortest programme ``loudnorm`` is trusted with, in seconds.  See
+#: :func:`_loudnorm`: below this it never establishes its gate and a silent mix
+#: comes out of the chain at full scale.
+LOUDNESS_MIN_DURATION = 3.0
+
+
+class _Unset:
+    """Sentinel: "take the loudness target from ``options``"."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<unset>"
+
+
+UNSET = _Unset()
+
 
 # --------------------------------------------------------------------------- #
 # small helpers
@@ -100,6 +142,54 @@ def _color(value: str) -> str:
     if text.startswith("#"):
         return "0x" + text[1:]
     return text
+
+
+def _loudnorm(target: float) -> str:
+    """Single-pass (dynamic) ``loudnorm`` aimed at ``target`` LUFS.
+
+    Single pass means no measurement run and no second ffmpeg process: the
+    filter gates and normalises as it goes.  Three properties of that mode are
+    load-bearing here, all measured against ffmpeg 6.1:
+
+    * It honours the EBU R128 **absolute gate at -70 LUFS**.  Material below it
+      -- digital silence, and anything quiet enough to be inaudible, such as the
+      timed silence the offline TTS provider produces -- is passed through
+      *unchanged* rather than being lifted 56 dB into a wall of hiss.
+    * Its output never exceeds ``TP``, which we keep below the downstream
+      limiter's ceiling, so normalisation cannot introduce clipping.
+    * **It needs three seconds to get there.**  Given less,
+      ``loudnorm,alimiter`` hands back below-gate input at roughly *0 dBFS* --
+      a 2s silent mix measures -91 dB through the limiter alone and -0.0 dB
+      through the pair.  (Each filter on its own is fine; it is the
+      combination, and only under three seconds.)  That is why callers go
+      through :data:`LOUDNESS_MIN_DURATION` instead of calling this blindly.
+    """
+    return f"loudnorm=I={_fmt(target)}:TP={_fmt(LOUDNESS_TRUE_PEAK)}:LRA={_fmt(LOUDNESS_RANGE)}"
+
+
+def _resolve_loudness(options: RenderOptions, override: float | None | _Unset) -> float | None:
+    """Work out the loudness target: explicit argument, then ``options``, then the default.
+
+    ``RenderOptions`` is the contract in :mod:`aiclipper.models`; this reads
+    ``loudness_target`` off it when it is there and falls back to
+    :data:`DEFAULT_LOUDNESS_TARGET` when it is not, so the renderer behaves the
+    same whether or not the field has been declared.  ``None`` -- from either
+    place -- disables normalisation and restores the pre-normalisation graph.
+    """
+    if isinstance(override, _Unset):
+        value = getattr(options, "loudness_target", DEFAULT_LOUDNESS_TARGET)
+    else:
+        value = override
+    if value is None:
+        return None
+    target = float(value)
+    low, high = _LOUDNESS_LIMITS
+    if not low <= target <= high:
+        raise RenderError(
+            "loudness target out of range",
+            problems=[f"loudness_target={_fmt(target)} LUFS is outside {_fmt(low)}..{_fmt(high)}"],
+        )
+    return target
 
 
 @dataclass
@@ -171,11 +261,13 @@ class _GraphBuilder:
         options: RenderOptions,
         settings: Settings,
         workdir: Path | None,
+        loudness_target: float | None = None,
     ) -> None:
         self.timeline = timeline
         self.out_path = Path(out_path)
         self.options = options
         self.settings = settings
+        self.loudness_target = loudness_target
         self._workdir = workdir
         self.inputs: list[_Input] = []
         self.chains: list[str] = []
@@ -428,6 +520,16 @@ class _GraphBuilder:
             "apad",
             f"atrim=duration={_fmt(self.duration)}",
             "asetpts=PTS-STARTPTS",
+        ]
+        # Normalise the finished mix, then limit: loudnorm sits *between* the
+        # mix and the limiter so the limiter is still the last thing to touch
+        # the samples and remains the clipping backstop.  Programmes too short
+        # for loudnorm to establish its gate are left alone -- see
+        # :func:`_loudnorm` -- which is also the floor that keeps a silent
+        # timeline silent.
+        if self.loudness_target is not None and self.duration >= LOUDNESS_MIN_DURATION:
+            tail.append(_loudnorm(self.loudness_target))
+        tail += [
             _LIMITER,
             "aresample=async=1",
             _AFORMAT,
@@ -551,6 +653,7 @@ def build_command(
     options: RenderOptions | None = None,
     settings: Settings | None = None,
     workdir: Path | None = None,
+    loudness_target: float | None | _Unset = UNSET,
 ) -> list[str]:
     """Return the complete ffmpeg argv (``argv[0]`` is the ffmpeg binary).
 
@@ -563,14 +666,21 @@ def build_command(
 
     No media is decoded here: sources are checked for existence, never probed,
     so a command can be built for files ffmpeg has not seen yet.
+
+    ``loudness_target`` overrides the integrated-loudness target in LUFS for
+    this call; left alone it comes from ``options.loudness_target`` when that
+    field exists and from :data:`DEFAULT_LOUDNESS_TARGET` otherwise, and
+    ``None`` disables normalisation entirely.
     """
     settings = settings or get_settings()
+    options = options or RenderOptions()
     builder = _GraphBuilder(
         timeline,
         Path(out_path),
-        options or RenderOptions(),
+        options,
         settings,
         Path(workdir) if workdir is not None else None,
+        _resolve_loudness(options, loudness_target),
     )
     return builder.build()
 
@@ -583,6 +693,7 @@ def render(
     settings: Settings | None = None,
     log_path: Path | None = None,
     dry_run: bool = False,
+    loudness_target: float | None | _Unset = UNSET,
 ) -> RenderResult:
     """Render ``timeline`` to ``out_path`` in a single ffmpeg invocation.
 
@@ -590,12 +701,22 @@ def render(
     but ffmpeg is never started; the returned :class:`RenderResult` carries the
     timeline's own geometry.  Otherwise the output is probed and the result
     reports what actually landed on disk.
+
+    ``loudness_target`` is forwarded to :func:`build_command`; ``None``
+    disables loudness normalisation.
     """
     settings = settings or get_settings()
     options = options or RenderOptions()
     out = Path(out_path)
     workdir = out.parent / f".{out.stem or 'timeline'}-render"
-    cmd = build_command(timeline, out, options=options, settings=settings, workdir=workdir)
+    cmd = build_command(
+        timeline,
+        out,
+        options=options,
+        settings=settings,
+        workdir=workdir,
+        loudness_target=loudness_target,
+    )
 
     if dry_run:
         return RenderResult(

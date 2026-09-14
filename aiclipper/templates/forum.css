@@ -1,44 +1,8 @@
-/* aiclipper forum story card -- original design, no site trade dress. */
-
-:root {
-  --fs: 3.0vw;
-  --card-bg: #1A1C24;
-  --title-fg: #F4F5FA;
-  --body-fg: #C3C7D6;
-  --meta-fg: #8A90A6;
-  --accent: #6F8CFF;
-  --chip-bg: #262A36;
-  --chip-fg: #D8DCEA;
-  --badge-fg: #101219;
-  --shadow: rgba(0, 0, 0, 0.55);
-  --edge: rgba(255, 255, 255, 0.08);
-}
-
-body[data-theme="light"] {
-  --card-bg: #FFFFFF;
-  --title-fg: #16181F;
-  --body-fg: #43474F;
-  --meta-fg: #7A8090;
-  --accent: #3B54C4;
-  --chip-bg: #EFF1F6;
-  --chip-fg: #3A3F4C;
-  --badge-fg: #FFFFFF;
-  --shadow: rgba(16, 19, 34, 0.40);
-  --edge: rgba(16, 19, 34, 0.10);
-}
-
-body[data-theme="paper"] {
-  --card-bg: #FBF6EC;
-  --title-fg: #2A2218;
-  --body-fg: #544838;
-  --meta-fg: #8C7B63;
-  --accent: #B2622A;
-  --chip-bg: #F0E6D4;
-  --chip-fg: #54462F;
-  --badge-fg: #FFFFFF;
-  --shadow: rgba(58, 44, 24, 0.38);
-  --edge: rgba(58, 44, 24, 0.12);
-}
+/* aiclipper forum story card -- original design, no site trade dress.
+ *
+ * No palette and no measurements live here: every value is a CSS custom
+ * property injected by aiclipper.overlays._forum_css_vars() from the one
+ * ForumTheme in THEMES -- the same data the Pillow backend draws with. */
 
 * {
   box-sizing: border-box;
@@ -54,7 +18,7 @@ body {
   height: 100%;
   background: transparent;
   overflow: hidden;
-  font-family: "DejaVu Sans", "Liberation Sans", "Noto Sans", Arial, sans-serif;
+  font-family: var(--font-stack);
   -webkit-font-smoothing: antialiased;
 }
 
@@ -64,7 +28,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 5vh 7vw;
+  padding: var(--stage-pad) var(--card-margin);
 }
 
 #card {
@@ -73,30 +37,30 @@ body {
      chips off the canvas (the Pillow backend trims to the same budget) */
   max-height: 100%;
   overflow: hidden;
-  padding: 5.2vw;
-  border-radius: 3.8vw;
+  padding: var(--card-pad);
+  border-radius: var(--card-radius);
   background: var(--card-bg);
-  border: 1px solid var(--edge);
-  box-shadow: 0 1.6vw 3.2vw var(--shadow);
+  border: var(--edge-w) solid var(--edge);
+  box-shadow: 0 var(--shadow-y) var(--shadow-blur) var(--shadow);
 }
 
 #meta {
   display: flex;
   align-items: center;
-  gap: 0.6em;
-  font-size: var(--fs);
+  gap: var(--meta-gap);
+  height: var(--meta-h);
 }
 
 #badge {
   flex: 0 0 auto;
-  width: 2em;
-  height: 2em;
+  width: var(--badge-d);
+  height: var(--badge-d);
   border-radius: 50%;
   background: var(--accent);
   color: var(--badge-fg);
   font-weight: 700;
-  font-size: var(--fs);
-  line-height: 2em;
+  font-size: var(--badge-fs);
+  line-height: var(--badge-d);
   text-align: center;
 }
 
@@ -104,36 +68,38 @@ body {
   color: var(--accent);
   font-weight: 700;
   font-size: var(--fs);
+  line-height: var(--meta-line);
 }
 
 #author {
   color: var(--meta-fg);
   font-size: var(--fs);
-  margin-top: 0.18em;
+  line-height: var(--meta-line);
+  margin-top: var(--author-gap);
 }
 
 #title {
-  margin-top: 0.95em;
+  margin-top: var(--gap-title);
   color: var(--title-fg);
-  font-size: calc(var(--fs) * 1.62);
+  font-size: var(--title-fs);
+  line-height: var(--title-lh);
   font-weight: 700;
-  line-height: 1.20;
   overflow-wrap: anywhere;
   display: -webkit-box;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: 8;
+  -webkit-line-clamp: var(--title-clamp);
   overflow: hidden;
 }
 
 #body {
-  margin-top: 0.9em;
+  margin-top: var(--gap-body);
   color: var(--body-fg);
-  font-size: calc(var(--fs) * 1.06);
-  line-height: 1.34;
+  font-size: var(--body-fs);
+  line-height: var(--body-lh);
   overflow-wrap: anywhere;
   display: -webkit-box;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: 7;
+  -webkit-line-clamp: var(--body-clamp);
   overflow: hidden;
 }
 
@@ -142,17 +108,17 @@ body {
 }
 
 #row {
-  margin-top: 1.25em;
+  margin-top: var(--gap-row);
   display: flex;
-  gap: 0.7em;
-  font-size: var(--fs);
+  gap: var(--chip-gap);
 }
 
 .chip {
   display: flex;
   align-items: center;
-  gap: 0.5em;
-  padding: 0.42em 0.7em;
+  gap: calc(var(--icon) * 0.96);
+  padding: 0 var(--chip-pad);
+  height: var(--chip-h);
   border-radius: 999px;
   background: var(--chip-bg);
   color: var(--chip-fg);
@@ -161,28 +127,30 @@ body {
 }
 
 .arrow {
+  flex: 0 0 auto;
   width: 0;
   height: 0;
-  border-left: 0.52em solid transparent;
-  border-right: 0.52em solid transparent;
-  border-bottom: 0.78em solid var(--accent);
+  border-left: var(--icon) solid transparent;
+  border-right: var(--icon) solid transparent;
+  border-bottom: calc(var(--icon) * 1.5) solid var(--accent);
 }
 
 .speech {
   position: relative;
-  width: 1.04em;
-  height: 0.78em;
-  border-radius: 0.24em;
+  flex: 0 0 auto;
+  width: calc(var(--icon) * 2);
+  height: calc(var(--icon) * 1.7);
+  border-radius: calc(var(--icon) * 0.45);
   background: var(--chip-fg);
 }
 
 .speech::after {
   content: "";
   position: absolute;
-  left: 0.18em;
-  top: 0.72em;
+  left: calc(var(--icon) * 0.45);
+  top: calc(var(--icon) * 1.6);
   width: 0;
   height: 0;
-  border-left: 0.3em solid var(--chip-fg);
-  border-bottom: 0.34em solid transparent;
+  border-left: calc(var(--icon) * 0.6) solid var(--chip-fg);
+  border-bottom: calc(var(--icon) * 0.75) solid transparent;
 }

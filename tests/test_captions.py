@@ -232,6 +232,126 @@ def test_group_does_not_split_on_initials_or_decimals() -> None:
     assert len(cues) == 1
 
 
+SENTENCE_MID_RE = re.compile(r"[.!?\u2026][\"')\u201d]?\s+\S")
+
+NARRATION = (
+    "Let me tell you about starting a business. I had no money at all. "
+    "Most people quit after the first year. Ninety percent of them never come back."
+)
+
+
+def spoken_words(text: str, *, start: float = 0.0) -> list[Word]:
+    """Plausible narration timings: word length drives duration, tiny gaps between."""
+    out: list[Word] = []
+    t = start
+    for token in text.split():
+        length = 0.18 + 0.05 * len(token)
+        out.append(Word(token, round(t, 3), round(t + length, 3)))
+        t += length + 0.03
+    return out
+
+
+def test_group_does_not_split_on_abbreviations() -> None:
+    """``Mr.`` is not the end of a thought -- only the real full stop is."""
+    style = replace(captions.get_style("clean"), max_words=99, max_chars=999)
+    cues = captions.group_words(words_from("Mr. Smith went home. Next up"), style)
+    assert [c.text for c in cues] == ["Mr. Smith went home.", "Next up"]
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        "the U.S. economy grew fast",          # dotted acronym
+        "call Dr. Jones at 9 a.m. tomorrow",   # abbreviation + dotted acronym
+        "it costs 3.5 million dollars",        # decimal
+        "we raised 19.99 and change",          # decimal
+        "step 3. never give up",               # list marker / split decimal head
+        "ask Mrs. Patel about the St. Cloud branch",
+    ],
+)
+def test_group_does_not_split_mid_sentence_on_dotted_tokens(spec: str) -> None:
+    style = replace(captions.get_style("clean"), max_words=99, max_chars=999)
+    cues = captions.group_words(words_from(spec), style)
+    assert [c.text for c in cues] == [spec], "a dot that is not a full stop split the line"
+
+
+@pytest.mark.parametrize("name", sorted(captions.PRESETS))
+def test_no_cue_welds_two_sentences_together(name: str) -> None:
+    """No cue may carry a sentence boundary in its middle."""
+    style = captions.get_style(name)
+    cues = captions.group_words(spoken_words(NARRATION), style)
+    welded = [c.text for c in cues if SENTENCE_MID_RE.search(c.text)]
+    assert welded == [], f"sentences welded into one cue: {welded}"
+
+
+def test_full_line_is_cut_on_clause_punctuation() -> None:
+    """A mid-sentence cut prefers a comma over an arbitrary ``max_chars`` break."""
+    style = replace(captions.get_style("clean"), max_words=6, max_chars=30)
+    cues = captions.group_words(spoken_words("hello there, my friend, this line is far too long"), style)
+    assert cues[0].text == "hello there, my friend,"
+    assert cues[1].text.startswith("this line")
+
+
+def test_clause_cut_never_overflows_the_next_cue() -> None:
+    """Moving words across a clause break must still respect the style limits."""
+    style = replace(captions.get_style("clean"), max_words=3, max_chars=24)
+    cues = captions.group_words(spoken_words(NARRATION), style)
+    assert all(len(c.words) <= 3 for c in cues)
+    assert all(len(c.text) <= 24 for c in cues)
+
+
+# --------------------------------------------------------------------------- #
+# cue timing: no holes inside continuous speech
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("name", sorted(captions.PRESETS))
+def test_cues_hold_until_the_next_one_starts(name: str) -> None:
+    """Continuous speech must produce a continuous caption track.
+
+    A cue that stops at its last word leaves a sub-frame hole before the next
+    one, which renders as a completely blank frame mid-sentence at 30fps.
+    """
+    style = captions.get_style(name)
+    words = spoken_words(NARRATION)
+    cues = captions.group_words(words, style)
+    assert len(cues) > 1
+    for first, second in zip(cues, cues[1:], strict=False):
+        speech_gap = second.words[0].start - first.words[-1].end
+        if speech_gap <= captions.GAP_SPLIT:
+            assert first.end == pytest.approx(second.start), (
+                f"hole of {second.start - first.end:.3f}s between {first.text!r} and {second.text!r}"
+            )
+
+
+def test_a_real_pause_still_clears_the_screen() -> None:
+    """Captions must not linger over silence longer than the split threshold."""
+    style = replace(captions.get_style("clean"), max_words=1, max_chars=99)
+    words = [Word("first", 0.0, 0.5), Word("second", 4.0, 4.5)]
+    a, b = captions.group_words(words, style)
+    assert 0.5 < a.end <= 0.5 + captions.HOLD_SECONDS
+    assert a.end < b.start
+
+
+def test_hold_keyword_controls_the_linger(sample_words: list[Word]) -> None:
+    """``hold`` is explicit and configurable, and only applies past real pauses."""
+    style = replace(captions.get_style("clean"), max_words=99, max_chars=999)
+    short = captions.group_words(sample_words, style, hold=0.1)
+    long = captions.group_words(sample_words, style, hold=0.9)
+    assert short[-1].end == pytest.approx(sample_words[-1].end + 0.1)
+    assert long[-1].end == pytest.approx(sample_words[-1].end + 0.9)
+    # the 1.16s pause before "Here" is wider than GAP_SPLIT, so the first cue
+    # clears -- but a hold wider than the pause simply runs into the next cue.
+    assert short[0].end < long[0].end <= short[1].start
+
+
+def test_gap_split_keyword_overrides_the_threshold(sample_words: list[Word]) -> None:
+    style = replace(captions.get_style("clean"), max_words=99, max_chars=999)
+    words = words_from("one two three four", per_word=0.3, gap=0.2)
+    assert len(captions.group_words(sample_words, style, gap_split=2.0)) == 1
+    assert len(captions.group_words(words, style, gap_split=0.5)) == 1
+    assert len(captions.group_words(words, style, gap_split=0.1)) == 4
+
+
 def test_group_skips_blank_words() -> None:
     style = captions.get_style("clean")
     words = [Word("real", 0.0, 0.3), Word("   ", 0.3, 0.4), Word("words", 0.4, 0.8)]
@@ -550,6 +670,20 @@ def test_dialogue_times_stay_inside_their_cue(tmp_path: Path) -> None:
             assert any(c.start - 0.01 <= start <= end <= c.end + 0.01 for c in cues)
 
 
+def test_written_dialogues_leave_no_timestamp_hole(tmp_path: Path) -> None:
+    """Centisecond rounding must not reopen the hole the hold closes."""
+    style = replace(captions.get_style("clean"), animation="none")
+    out = captions.build(spoken_words(NARRATION), tmp_path / "hold.ass", style=style,
+                         width=1080, height=1920)
+    lines = dialogues(out.read_text(encoding="utf-8"))
+    words = spoken_words(NARRATION)
+    speech_end = words[-1].end
+    for (_, end, _), (start, _, _) in zip(lines, lines[1:], strict=False):
+        if start >= speech_end:
+            continue
+        assert start - end <= 0.0 + 1e-9, f"{start - end:.2f}s uncovered at {end:.2f}"
+
+
 def test_build_creates_parent_directories(tmp_path: Path) -> None:
     target = tmp_path / "nested" / "deeper" / "caps.ass"
     out = captions.build(words_from("nested output path"), target, style="neon")
@@ -747,3 +881,106 @@ def test_ffmpeg_long_lines_wrap_inside_the_canvas(tmp_path: Path) -> None:
     assert len(cols), "nothing was drawn"
     assert cols.min() >= margin_h - 8 and cols.max() <= 320 - margin_h + 8, "text ran past the margins"
     assert rows.max() - rows.min() > style.font_size * 0.9, "the long line did not wrap onto 2+ lines"
+
+
+@pytest.mark.needs_ffmpeg
+@pytest.mark.slow
+def test_ffmpeg_never_blanks_a_frame_between_cues(tmp_path: Path) -> None:
+    """Burn a multi-sentence track at 30fps: every frame of speech has a caption."""
+    if not ff.has_filter("subtitles"):
+        pytest.skip("this ffmpeg build has no subtitles filter")
+    import numpy as np
+    from PIL import Image
+
+    words = spoken_words(NARRATION)[:18]
+    duration = round(words[-1].end + 0.2, 2)
+    style = replace(captions.get_style("clean"), font_size=30, outline=2.0, shadow=1.0,
+                    margin_v=120, margin_h=20, animation="none")
+    ass_path = captions.build(words, tmp_path / "hold.ass", style=style, width=320, height=568)
+
+    out = tmp_path / "hold.mp4"
+    ff.run_ffmpeg(
+        ["-y", "-f", "lavfi", "-i", f"color=c=black:s=320x568:r=30:d={duration}",
+         "-vf", f"subtitles={ff.escape_filter_path(ass_path)}", "-t", str(duration),
+         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(out)],
+        timeout=300,
+    )
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    ff.run_ffmpeg(["-y", "-i", str(out), "-vf", "fps=30", str(frames / "f%04d.png")], timeout=300)
+
+    pngs = sorted(frames.glob("*.png"))
+    assert len(pngs) > 30
+    blank: list[float] = []
+    for index, png in enumerate(pngs):
+        at = index / 30.0
+        if at >= words[-1].end:
+            break
+        grey = np.asarray(Image.open(png).convert("L"))
+        if int((grey > 120).sum()) < 20:
+            blank.append(round(at, 3))
+    assert blank == [], f"blank caption frames mid-speech at t={blank}"
+
+
+# --------------------------------------------------------------------------- #
+# a word wider than the canvas
+# --------------------------------------------------------------------------- #
+
+def test_ordinary_words_never_get_a_font_size_override():
+    """The fit pass is conservative: normal speech comes out byte-for-byte as before."""
+    words = spoken_words(NARRATION)[:12]
+    for name in captions.PRESETS:
+        cues = captions.group_words(words, captions.get_style(name))
+        for cue in cues:
+            for line in captions._cue_dialogues(cue, captions.get_style(name), 1080, 1920):
+                assert not re.search(r"\\fs\d", line), f"{name} shrank an ordinary cue: {line}"
+
+
+def test_a_word_too_wide_for_the_canvas_is_shrunk_to_fit():
+    style = captions.get_style("bold_yellow")
+    long_word = "pneumonoultramicroscopicsilicovolcanoconiosis"
+    cue = CaptionCue(start=0.0, end=1.0, words=[Word(long_word, 0.0, 1.0)])
+    lines = captions._cue_dialogues(cue, style, 1080, 1920)
+    assert lines
+    sizes = {int(m) for line in lines for m in re.findall(r"\\fs(\d+)", line)}
+    assert sizes, "an unbreakable word wider than the canvas was left at full size"
+    size = sizes.pop()
+    assert size < style.font_size
+    assert size >= captions.MIN_FIT_SIZE
+
+
+@pytest.mark.needs_ffmpeg
+@pytest.mark.slow
+def test_long_word_stays_on_canvas_in_every_preset(tmp_path: Path):
+    """Burn each preset and check nothing is painted past either canvas edge."""
+    import numpy as np
+    from PIL import Image
+
+    width, height = 1080, 1920
+    text = (
+        "internationalization uncharacteristically #averyverylonghashtagindeed "
+        "pneumonoultramicroscopicsilicovolcanoconiosis"
+    )
+    words: list[Word] = []
+    at = 0.0
+    for token in text.split():
+        span = 0.2 + 0.03 * len(token)
+        words.append(Word(token, round(at, 3), round(at + span, 3)))
+        at += span + 0.05
+    duration = round(at + 0.3, 2)
+
+    for name in captions.PRESETS:
+        ass_path = captions.build(words, tmp_path / f"{name}.ass", style=name, width=width, height=height)
+        out = tmp_path / name
+        out.mkdir()
+        ff.run_ffmpeg(
+            ["-y", "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r=4:d={duration}",
+             "-vf", f"subtitles={ff.escape_filter_path(ass_path)}", str(out / "f%03d.png")],
+            timeout=300,
+        )
+        touched = []
+        for png in sorted(out.glob("*.png")):
+            grey = np.asarray(Image.open(png).convert("L"))
+            if int((grey[:, 0] > 30).sum()) or int((grey[:, -1] > 30).sum()):
+                touched.append(png.name)
+        assert touched == [], f"{name} painted text on the canvas edge in {touched[:3]}"

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -416,14 +417,19 @@ def test_public_contract_matches_the_architecture_spec():
     assert (image.path, image.width, image.height, image.index) == (Path("x.png"), 10, 20, 3)
 
     chat = inspect.signature(overlays.render_chat)
-    assert list(chat.parameters) == ["script", "out_dir", "width", "height", "settings", "backend"]
+    assert list(chat.parameters) == ["script", "out_dir", "width", "height", "settings", "backend",
+                                     "header_state"]
     assert chat.parameters["out_dir"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
-    for name in ("width", "height", "settings", "backend"):
+    for name in ("width", "height", "settings", "backend", "header_state"):
         assert chat.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
     assert chat.parameters["width"].default is inspect.Parameter.empty
     assert chat.parameters["height"].default is inspect.Parameter.empty
     assert chat.parameters["settings"].default is None
     assert chat.parameters["backend"].default is None
+    # the extra header state is opt-in: today's callers (the texts pipeline maps
+    # states to beats by index) keep exactly the states they had before
+    assert chat.parameters["header_state"].default is False
+    assert inspect.signature(overlays.chat_states).parameters["header_state"].default is False
 
     card = inspect.signature(overlays.render_forum_card)
     assert list(card.parameters) == ["post", "out_path", "width", "height", "settings", "backend"]
@@ -579,3 +585,274 @@ def test_chromium_forum_card_with_a_runaway_title_stays_inside_the_canvas(tmp_pa
                                        backend="chromium")
     rows = np.where(alpha_of(image.path).max(axis=1) > 0)[0]
     assert rows.min() > 0 and rows.max() < SMALL[1] - 1
+
+
+# --------------------------------------------------------------------------- #
+# one theme, one definition (chromium/pillow parity)
+# --------------------------------------------------------------------------- #
+
+def _css(name: str) -> str:
+    return (overlays.TEMPLATE_DIR / name).read_text(encoding="utf-8")
+
+
+def test_the_stylesheets_carry_no_palette_and_no_measurements():
+    """Regression: the CSS used to hold a second copy of every theme.
+
+    Two copies meant the documented "silently falls back to pillow" silently
+    changed the artwork, so the values now live only in :data:`overlays.THEMES`.
+    """
+    for name in ("chat.css", "forum.css"):
+        text = re.sub(r"/\*.*?\*/", " ", _css(name), flags=re.S)
+        values = " ".join(re.findall(r":([^;{}]*)[;}]", text))
+        assert not re.search(r"#[0-9A-Fa-f]{3,8}\b", values), f"{name} still hardcodes a colour"
+        # the only literal colours left are the black/transparent stops of the feed mask
+        leftovers = [c for c in re.findall(r"rgba?\([^)]*\)", values)
+                     if not re.fullmatch(r"rgba\(0, 0, 0, [01]\)", c)]
+        assert leftovers == [], f"{name} still hardcodes {leftovers}"
+        assert not re.search(r"\d\s*(vw|vh)\b", values), f"{name} still hardcodes a canvas measurement"
+        assert "data-theme" not in text, f"{name} still switches palettes itself"
+
+
+def test_every_css_variable_the_templates_use_is_supplied_by_python():
+    """Nothing may fall back to a browser default the Pillow backend cannot see."""
+    chat_vars = set(overlays._chat_css_vars(
+        overlays.CHAT_THEMES["classic"],
+        overlays._chat_metrics(overlays.CHAT_THEMES["classic"], *CANVAS),
+        "#123456", "",
+    ))
+    forum_vars = set(overlays._forum_css_vars(
+        overlays.FORUM_THEMES["dark"],
+        overlays._forum_metrics(overlays.FORUM_THEMES["dark"], *CANVAS),
+        "",
+    ))
+    for name, supplied in (("chat.css", chat_vars), ("forum.css", forum_vars)):
+        used = set(re.findall(r"var\((--[\w-]+)", _css(name)))
+        assert used, f"{name} uses no custom properties at all"
+        assert used <= supplied, f"{name} uses undefined {sorted(used - supplied)}"
+
+
+def test_the_injected_css_variables_are_the_pillow_metrics():
+    """The browser is handed the numbers Pillow lays out with, not its own copy."""
+    theme = overlays.CHAT_THEMES["dark"]
+    m = overlays._chat_metrics(theme, *CANVAS)
+    css = overlays._chat_css_vars(theme, m, "#0A0B0C", "")
+    assert css["--fs"] == f"{m.font_size}px"
+    assert css["--radius"] == f"{m.radius}px"
+    assert css["--margin"] == f"{m.margin}px"
+    assert css["--avatar-d"] == f"{m.avatar_d}px"
+    assert css["--bubble-max"] == f"{m.max_bubble_w}px"
+    assert css["--in-bg"] == theme.in_bg and css["--out-bg"] == theme.out_bg
+    assert css["--edge"] == overlays._css_rgba(theme.outline, theme.outline_alpha)
+    assert css["--avatar-bg"] == "#0A0B0C"   # the caller's resolved colour, not theme.avatar_bg
+
+    forum = overlays.FORUM_THEMES["paper"]
+    fm = overlays._forum_metrics(forum, *CANVAS)
+    fcss = overlays._forum_css_vars(forum, fm, "")
+    assert fcss["--card-bg"] == forum.card_bg and fcss["--accent"] == forum.accent
+    assert fcss["--card-radius"] == f"{fm.radius}px"
+    assert fcss["--title-clamp"] == str(fm.title_lines)
+
+
+def test_the_chromium_payload_carries_the_avatar_colour_pillow_would_draw():
+    """Defect: pillow picked a seeded accent, the browser always used theme.avatar_bg."""
+    settings = get_settings()
+    script = ChatScript(contact="Kit", theme="classic",
+                        messages=[ChatMessage("Kit", "hey", False)])
+    payload = overlays._chat_payload(script, *CANVAS, settings)
+    assert payload["vars"]["--avatar-bg"] == overlays._avatar_color(script, settings)
+
+
+def _centroid(path: Path, color: str, tol: int = 10) -> tuple[float, float] | None:
+    """Centre of mass of the pixels matching ``color``, or ``None`` if unpainted."""
+    want = np.array(overlays._hex_rgb(color), dtype=np.int16)
+    with Image.open(path) as img:
+        arr = np.array(img).astype(np.int16)
+    hit = (np.abs(arr[..., :3] - want).max(axis=2) <= tol) & (arr[..., 3] > 200)
+    if not hit.any():
+        return None
+    ys, xs = np.nonzero(hit)
+    return (float(xs.mean()), float(ys.mean()))
+
+
+def test_chromium_and_pillow_paint_the_same_theme(tmp_path: Path):
+    """Both backends must agree on colour *and* placement, within a few pixels.
+
+    "Kit" is the reproducer from the audit: the seeded avatar accent resolves to
+    a teal, which the browser used to ignore in favour of the stylesheet's blue.
+    """
+    settings = get_settings()
+    chromium_or_skip(settings)
+
+    script = ChatScript(
+        contact="Kit", avatar_initials="K", theme="classic",
+        messages=[
+            ChatMessage("Kit", "so did you actually go last night?", False),
+            ChatMessage("me", "i did. you will not believe who was there", True),
+            ChatMessage("Kit", "no way", False),
+        ],
+    )
+    theme = overlays.CHAT_THEMES["classic"]
+    shots = {
+        backend: overlays.render_chat(script, tmp_path / backend, width=SMALL[0], height=SMALL[1],
+                                      backend=backend)[-1].path
+        for backend in ("chromium", "pillow")
+    }
+    slack_x, slack_y = SMALL[0] * 0.02, SMALL[1] * 0.02
+
+    landmarks = {
+        "avatar": overlays._avatar_color(script, settings),
+        "incoming bubble": theme.in_bg,
+        "outgoing bubble": theme.out_bg,
+    }
+    for what, color in landmarks.items():
+        spots = {b: _centroid(p, color) for b, p in shots.items()}
+        for backend, spot in spots.items():
+            assert spot is not None, f"{backend} never painted the {what} in {color}"
+        (cx, cy), (px, py) = spots["chromium"], spots["pillow"]
+        assert abs(cx - px) < slack_x, f"{what} sits at a different x: {cx} vs {px}"
+        assert abs(cy - py) < slack_y, f"{what} sits at a different y: {cy} vs {py}"
+
+    # ... and the whole composition occupies the same band of the canvas
+    boxes = {}
+    for backend, path in shots.items():
+        alpha = alpha_of(path)
+        rows = np.where(alpha.max(axis=1) > 0)[0]
+        cols = np.where(alpha.max(axis=0) > 0)[0]
+        boxes[backend] = (cols.min(), rows.min(), cols.max(), rows.max())
+    for chrome, pil, slack in zip(boxes["chromium"], boxes["pillow"],
+                                  (slack_x, slack_y, slack_x, slack_y), strict=True):
+        assert abs(int(chrome) - int(pil)) < slack
+
+
+def test_chromium_and_pillow_paint_the_same_forum_card(tmp_path: Path):
+    settings = get_settings()
+    chromium_or_skip(settings)
+
+    post = a_post(theme="light")
+    theme = overlays.FORUM_THEMES["light"]
+    shots = {
+        backend: overlays.render_forum_card(post, tmp_path / f"{backend}.png", width=SMALL[0],
+                                            height=SMALL[1], backend=backend).path
+        for backend in ("chromium", "pillow")
+    }
+    slack_x, slack_y = SMALL[0] * 0.03, SMALL[1] * 0.03
+    for what, color in (("card", theme.card_bg), ("accent", theme.accent), ("chip", theme.chip_bg)):
+        spots = {b: _centroid(p, color) for b, p in shots.items()}
+        for backend, spot in spots.items():
+            assert spot is not None, f"{backend} never painted the {what} in {color}"
+        (cx, cy), (px, py) = spots["chromium"], spots["pillow"]
+        assert abs(cx - px) < slack_x and abs(cy - py) < slack_y, f"{what}: {spots}"
+
+
+# --------------------------------------------------------------------------- #
+# the leading header-only state
+# --------------------------------------------------------------------------- #
+
+def test_header_state_is_opt_in_and_adds_one_leading_frame():
+    script = conversation()
+    plain = overlays.chat_states(script)
+    withhead = overlays.chat_states(script, header_state=True)
+
+    assert [s.visible for s in plain] == [1, 1, 2, 3, 3, 4, 5, 6]
+    assert len(withhead) == len(plain) + 1
+    assert withhead[0] == overlays.ChatState(index=0, visible=0, typing=False, outgoing=False)
+    # every message state keeps its identity, one place further along
+    assert [(s.visible, s.typing) for s in withhead[1:]] == [(s.visible, s.typing) for s in plain]
+    assert [s.index for s in withhead] == list(range(len(withhead)))
+    # an empty conversation still has nothing to show
+    assert overlays.chat_states(ChatScript(contact="Nobody"), header_state=True) == []
+
+
+@pytest.mark.parametrize("backend", ["pillow", "chromium"])
+def test_the_first_frame_is_the_chrome_with_no_bubbles(tmp_path: Path, backend: str):
+    """Defect: the video opened on a bare background during the first delay."""
+    if backend == "chromium":
+        chromium_or_skip(get_settings())
+    script = conversation()
+    images = overlays.render_chat(script, tmp_path / backend, width=SMALL[0], height=SMALL[1],
+                                  backend=backend, header_state=True)
+
+    assert len(images) == len(overlays.chat_states(script)) + 1
+    assert [im.index for im in images] == list(range(len(images)))
+    assert [im.path.name for im in images] == [f"chat_{i:03d}.png" for i in range(len(images))]
+
+    header = alpha_of(images[0].path)
+    assert (header > 0).sum() > 0, "the first frame must not be empty"
+    # ...and all of its ink is the header: nothing is painted down in the feed
+    feed_top = overlays._chat_metrics(overlays.CHAT_THEMES[script.theme], *SMALL).content_top
+    assert int((header[feed_top:] > 0).sum()) == 0
+    # the bubbles start one frame later and still grow one state at a time
+    counts = [opaque_count(im.path) for im in images]
+    assert counts == sorted(counts)
+    assert counts[1] > counts[0]
+
+
+def test_header_state_keeps_the_message_frames_identical(tmp_path: Path):
+    """Turning the flag on must only *prepend*, never re-render the rest."""
+    script = conversation()
+    plain = overlays.render_chat(script, tmp_path / "off", width=SMALL[0], height=SMALL[1],
+                                 backend="pillow")
+    shifted = overlays.render_chat(script, tmp_path / "on", width=SMALL[0], height=SMALL[1],
+                                   backend="pillow", header_state=True)
+    assert [p.path.read_bytes() for p in plain] == [p.path.read_bytes() for p in shifted[1:]]
+
+
+# --------------------------------------------------------------------------- #
+# font resolution
+# --------------------------------------------------------------------------- #
+
+def test_font_resolution_prefers_a_colour_emoji_font(tmp_path: Path, monkeypatch):
+    """A colour face wins over a monochrome one -- see the module docstring."""
+    fonts = tmp_path / "assets" / "fonts"
+    fonts.mkdir(parents=True)
+    (fonts / "NotoEmoji-Regular.ttf").write_bytes(b"\0")
+    settings = Settings(assets_dir=tmp_path / "assets")
+    monkeypatch.setattr(overlays, "_emoji_font_cache", {})
+    monkeypatch.setattr(overlays, "_FONT_DIRS", ())          # only our sandbox counts
+    assert overlays._emoji_font(settings) == (str(fonts / "NotoEmoji-Regular.ttf"), False)
+
+    (fonts / "NotoColorEmoji.ttf").write_bytes(b"\0")
+    monkeypatch.setattr(overlays, "_emoji_font_cache", {})
+    assert overlays._emoji_font(settings) == (str(fonts / "NotoColorEmoji.ttf"), True)
+    assert overlays._emoji_family(settings) == "Noto Color Emoji"
+
+    # the emoji face is a *fallback*: putting it first would hand the browser its
+    # very wide space glyph for ordinary text
+    stack = overlays._font_stack("Noto Color Emoji")
+    assert stack.endswith('"Noto Color Emoji"')
+    assert stack.index("DejaVu Sans") < stack.index("Noto Color Emoji")
+    assert overlays._font_stack("") == overlays._font_stack()
+
+
+def test_no_emoji_font_at_all_is_not_an_error(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(overlays, "_emoji_font_cache", {})
+    monkeypatch.setattr(overlays, "_FONT_DIRS", ())
+    settings = Settings(assets_dir=tmp_path / "nope")
+    assert overlays._emoji_font(settings) is None
+    assert overlays._emoji_family(settings) == ""
+
+
+def test_chromium_and_pillow_forum_shadows_reach_the_same_distance(tmp_path: Path):
+    """The card's drop shadow must not be twice as wide in one backend.
+
+    CSS ``box-shadow``'s blur radius is *twice* the Gaussian sigma, so handing
+    the raw blur to ``ImageFilter.GaussianBlur`` used to spread the Pillow card's
+    shadow about 2x further than Chromium's -- a soft halo instead of a drop.
+    """
+    settings = get_settings()
+    chromium_or_skip(settings)
+
+    post = a_post()
+    made = {
+        name: overlays.render_forum_card(post, tmp_path / f"{name}.png",
+                                         width=CANVAS[0], height=CANVAS[1], backend=name)
+        for name in ("chromium", "pillow")
+    }
+    boxes = {}
+    for name, image in made.items():
+        rows = np.where(alpha_of(image.path).max(axis=1) > 0)[0]
+        cols = np.where(alpha_of(image.path).max(axis=0) > 0)[0]
+        boxes[name] = (int(cols.min()), int(rows.min()), int(cols.max()), int(rows.max()))
+    chrome, pillow = boxes["chromium"], boxes["pillow"]
+    for axis, (a, b) in enumerate(zip(chrome, pillow, strict=True)):
+        assert abs(a - b) <= 12, f"painted extent {axis} differs: {chrome} vs {pillow}"

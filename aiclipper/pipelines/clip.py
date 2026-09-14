@@ -23,13 +23,17 @@ layer, so a clip sounds like the moment it was cut from.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 from ..config import Settings, get_settings
 from ..errors import AiclipperError, IngestError
 from ..models import (
+    CaptionCue,
+    CaptionStyle,
     ClipCandidate,
     CropPath,
     MediaInfo,
@@ -39,6 +43,7 @@ from ..models import (
     Timeline,
     Transcript,
     VisualLayer,
+    Word,
 )
 from . import common
 
@@ -66,6 +71,9 @@ MIN_RENDERABLE = 0.2
 #: How much of the source stem / title slug survives into the output name.
 _STEM_CHARS = 24
 _TITLE_CHARS = 28
+
+#: Timing differences below this are float noise, not a word cut in half.
+_EPSILON = 1e-6
 
 
 # --------------------------------------------------------------------------- #
@@ -142,6 +150,55 @@ def _clamped(candidates: list[ClipCandidate], limit: float) -> list[ClipCandidat
     return out
 
 
+def _whole_word_window(words: Sequence[Word], start: float, end: float) -> tuple[float, float]:
+    """Pull ``[start, end)`` back onto whole-word edges, never outwards.
+
+    :func:`aiclipper.highlight.select` already snaps to word edges, but a window
+    does not necessarily survive the trip: clamping it to the probed media
+    duration (:func:`_clamped`) can land inside the final word, and the evenly
+    spaced fallback windows know nothing about speech at all.  Either way
+    :meth:`~aiclipper.models.Transcript.slice` would hand the caption builder a
+    word truncated to the boundary, and the render would cut it mid-read.
+
+    So both edges move *inwards* to the nearest whole word: a word straddling
+    the head is dropped (the clip starts after it), and the tail ends on the
+    last word that fits entirely.  Shrinking rather than growing keeps the
+    window inside the media, inside ``max_duration`` and clear of its
+    neighbours; the price is at most one part-heard word per edge.  A window
+    holding no whole word at all is left exactly as it was -- a truncated word
+    still beats no clip.
+    """
+    inside = [w for w in words if w.end > start + _EPSILON and w.start < end - _EPSILON]
+    whole = [w for w in inside if w.start >= start - _EPSILON and w.end <= end + _EPSILON]
+    if not inside or not whole:
+        return start, end
+    new_start = start if inside[0] is whole[0] else whole[0].start
+    new_end = end if inside[-1] is whole[-1] else whole[-1].end
+    if new_end - new_start <= MIN_RENDERABLE:
+        return start, end
+    return round(max(0.0, new_start), 6), round(new_end, 6)
+
+
+def _snapped(candidates: list[ClipCandidate], transcript: Transcript) -> list[ClipCandidate]:
+    """Apply :func:`_whole_word_window` to every candidate, in place of nothing."""
+    words = transcript.words
+    if not words:
+        return candidates
+    out: list[ClipCandidate] = []
+    for candidate in candidates:
+        start, end = _whole_word_window(words, float(candidate.start), float(candidate.end))
+        if (start, end) != (candidate.start, candidate.end):
+            log.debug(
+                "snapped clip window %.3f-%.3f to whole words %.3f-%.3f",
+                candidate.start,
+                candidate.end,
+                start,
+                end,
+            )
+        out.append(dataclasses.replace(candidate, start=start, end=end))
+    return out
+
+
 def _transcribe(media: MediaInfo, settings: Settings) -> tuple[Transcript, str]:
     """Transcribe the source once, degrading to an empty transcript.
 
@@ -172,18 +229,21 @@ def _select(
 
     picked: list[ClipCandidate] = []
     if not transcript.is_empty:
-        picked = _clamped(
-            list(
-                highlight.select(
-                    transcript,
-                    count=count,
-                    min_duration=min_duration,
-                    max_duration=max_duration,
-                    settings=settings,
-                    provider=provider,
-                )
+        picked = _snapped(
+            _clamped(
+                list(
+                    highlight.select(
+                        transcript,
+                        count=count,
+                        min_duration=min_duration,
+                        max_duration=max_duration,
+                        settings=settings,
+                        provider=provider,
+                    )
+                ),
+                media.duration,
             ),
-            media.duration,
+            transcript,
         )
     if picked:
         return picked, "highlight"
@@ -192,7 +252,7 @@ def _select(
     windows = even_windows(
         media.duration, count=count, min_duration=min_duration, max_duration=max_duration
     )
-    return _clamped(windows, media.duration), "even"
+    return _snapped(_clamped(windows, media.duration), transcript), "even"
 
 
 # --------------------------------------------------------------------------- #
@@ -234,6 +294,66 @@ def _crop_for(
     if path.is_static and mode == "track":
         mode = "track-static"
     return path, mode
+
+
+def _fit_cues(cues: Sequence[CaptionCue], duration: float, *, minimum: float) -> list[CaptionCue]:
+    """Trim a cue list to ``[0, duration]``, dropping what is left of nothing.
+
+    Cues are built from word timings alone, and the last one deliberately
+    lingers past its final word (``captions.HOLD_SECONDS``).  On a clip that
+    ends on a word edge that linger has nowhere to go: the cue outlives the
+    video.  Trimming here keeps the caption clock and the clip's own clock
+    honest -- no cue starts at or past the end, none ends after it.
+    """
+    out: list[CaptionCue] = []
+    for cue in cues:
+        start = max(0.0, float(cue.start))
+        end = min(float(cue.end), duration)
+        if end - start < minimum - _EPSILON:
+            continue
+        words = [w for w in cue.words if w.start < end - _EPSILON]
+        if not words:
+            continue
+        out.append(CaptionCue(start=start, end=end, words=list(words)))
+    return out
+
+
+def _caption_track(
+    words: Sequence[Word],
+    out_dir: Path,
+    *,
+    style: CaptionStyle | None,
+    width: int,
+    height: int,
+    duration: float,
+    name: str,
+    settings: Settings,
+) -> SubtitleTrack | None:
+    """Like :func:`common.caption_track`, but clamped to this clip's timeline.
+
+    Same grouping, same preset, same reference resolution -- the cue list is
+    simply cut to ``duration`` first (see :func:`_fit_cues`), because a clip is
+    a window out of a longer talk and has no room past its own last frame.
+    """
+    if style is None or not words or duration <= 0.0:
+        return None
+
+    from .. import captions as captions_module
+
+    target = Path(out_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    play_w, play_h = common.caption_resolution(width, height)
+    resolved = captions_module.get_style(style)
+    cues = _fit_cues(
+        captions_module.group_words(words, resolved), duration, minimum=captions_module.MIN_CUE
+    )
+    if not cues:
+        return None
+    ass_path = captions_module.write_ass(
+        cues, target / name, style=resolved, width=play_w, height=play_h
+    )
+    fonts = settings.fonts_dir
+    return SubtitleTrack(ass_path=ass_path, fonts_dir=fonts if fonts.is_dir() else None)
 
 
 def _out_directory(out_dir: str | Path | None) -> str | None:
@@ -389,13 +509,13 @@ def run(
         )
         window = transcript.slice(candidate.start, candidate.end, rebase=True)
         words = window.words
-        subtitles = common.caption_track(
+        subtitles = _caption_track(
             words,
             work / "captions",
             style=caption_style,
             width=width,
             height=height,
-            enabled=captions,
+            duration=round(candidate.duration, 3),
             name=f"{stem}.ass",
             settings=s,
         )

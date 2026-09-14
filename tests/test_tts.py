@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -27,21 +28,25 @@ from aiclipper.tts import (
     VOICES,
     EdgeTTS,
     ElevenLabsTTS,
+    NarrationResults,
     OfflineTTS,
     Voice,
     estimate_duration,
+    fallback_chain,
     find_voice,
     find_voice_entry,
     get_provider,
     list_voices,
     plan_words,
+    provider_usable,
+    reset_usable_cache,
     resolve_voice_id,
     synthesize_lines,
     total_duration,
 )
 from aiclipper.tts import edge as edge_mod
 from aiclipper.tts import eleven as eleven_mod
-from aiclipper.tts.base import PROVIDER_ALIASES, TTSProvider
+from aiclipper.tts.base import PROVIDER_ALIASES, TTSProvider, run_bounded
 
 EPS = 1e-3
 
@@ -1230,3 +1235,375 @@ class _FakeBody:
 
     def close(self) -> None:
         return None
+
+
+# --------------------------------------------------------------------------- #
+# runtime fallback: a backend that dies part way through a narration
+# --------------------------------------------------------------------------- #
+
+class _Flaky:
+    """A backend that speaks a distinctive tone until it drops the connection.
+
+    Its audio is deliberately nothing like the offline backend's -- a long tone
+    instead of a short silence -- so a test can tell, from the files on disk,
+    *which* backend spoke each line.
+    """
+
+    name = "flaky"
+
+    def __init__(self, *, fail_on: int, seconds: float = 3.0) -> None:
+        self.fail_on = fail_on          # 1-based line number that blows up
+        self.seconds = seconds
+        self.calls: list[str] = []
+
+    def available(self) -> bool:
+        return True
+
+    def synthesize(self, text: str, out_path: Path, *, voice: VoiceSpec) -> TTSResult:
+        self.calls.append(text)
+        if len(self.calls) >= self.fail_on:
+            raise TTSError("the service dropped the connection")
+        ff.make_tone(self.seconds, Path(out_path))
+        return TTSResult(audio_path=Path(out_path), duration=self.seconds,
+                         words=[Word(text, 0.0, self.seconds, 1.0)], voice=voice, text=text)
+
+
+@pytest.mark.needs_ffmpeg
+def test_a_backend_that_dies_mid_narration_does_not_kill_the_render(tmp_path: Path):
+    """The bug: one blip on line 3 used to abort a render with a live offline path."""
+    flaky = _Flaky(fail_on=3)
+    lines = ["First line here.", "Second line here.", "Third line here.", "Fourth line here."]
+    out_dir = tmp_path / "vo"
+
+    results = synthesize_lines(lines, out_dir, voice=VoiceSpec(), provider=flaky, gap=0.1)
+
+    assert isinstance(results, NarrationResults)
+    assert len(results) == len(lines), "every line must still be spoken"
+    assert results.provider == "offline", "the reported backend must be the one that ran"
+    assert results.attempted == ("flaky", "offline")
+    assert results.fell_back is True
+    assert flaky.calls == lines[:3], "the failed backend must not be asked for the rest"
+
+
+@pytest.mark.needs_ffmpeg
+def test_the_fallback_respeaks_every_line_so_the_voice_stays_consistent(tmp_path: Path):
+    """Lines 1-2 were already on disk in the flaky voice; they must be redone."""
+    flaky = _Flaky(fail_on=3, seconds=3.0)
+    lines = ["First line here.", "Second line here.", "Third line here."]
+    out_dir = tmp_path / "vo"
+
+    results = synthesize_lines(lines, out_dir, voice=VoiceSpec(), provider=flaky, gap=0.1)
+
+    for index, line in enumerate(lines):
+        path = out_dir / f"line_{index:03d}.wav"
+        assert path.exists()
+        measured = ff.probe(path).duration
+        assert abs(measured - flaky.seconds) > 0.5, (
+            f"line {index} is still the flaky backend's audio -- half the narration "
+            "would be in a different voice"
+        )
+        assert abs(results[index].duration - estimate_duration(line)) < 0.25
+        assert abs(measured - results[index].duration) < 0.1
+    assert all(r.words for r in results), "the fallback's word timings must reach the caller"
+
+    # The rebasing contract still holds across the re-synthesis.
+    offset = 0.0
+    for result in results:
+        assert result.words[0].start >= offset - EPS
+        offset += result.duration + 0.1
+
+
+@pytest.mark.needs_ffmpeg
+def test_a_backend_that_fails_on_the_very_first_line_falls_back_too(tmp_path: Path):
+    results = synthesize_lines(["only line"], tmp_path / "vo", voice=VoiceSpec(),
+                               provider=_Flaky(fail_on=1))
+    assert results.provider == "offline"
+    assert results[0].words
+
+
+@pytest.mark.needs_ffmpeg
+def test_fallback_false_still_raises(tmp_path: Path):
+    """Strictness is a caller's right: no silent substitution when asked not to."""
+    flaky = _Flaky(fail_on=2)
+    with pytest.raises(TTSError, match="dropped the connection"):
+        synthesize_lines(["a line", "another line"], tmp_path / "vo", voice=VoiceSpec(),
+                         provider=flaky, fallback=False)
+    assert flaky.calls == ["a line", "another line"]
+    assert not (tmp_path / "vo" / "line_001.wav").exists()
+
+
+@pytest.mark.needs_ffmpeg
+def test_a_chain_that_fails_all_the_way_down_raises_the_last_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    def explode(self, text, out_path, *, voice):
+        raise TTSError("ffmpeg is gone too")
+
+    monkeypatch.setattr(OfflineTTS, "synthesize", explode)
+    with pytest.raises(TTSError, match="ffmpeg is gone too"):
+        synthesize_lines(["a line"], tmp_path / "vo", voice=VoiceSpec(), provider=_Flaky(fail_on=1))
+
+
+@pytest.mark.needs_ffmpeg
+def test_a_narration_that_works_reports_its_own_backend(tmp_path: Path):
+    results = synthesize_lines(["hello there"], tmp_path / "vo", voice=VoiceSpec(), provider="offline")
+    assert results.provider == "offline"
+    assert results.attempted == ("offline",)
+    assert results.fell_back is False
+    assert isinstance(results, list) and len(results) == 1
+
+
+def test_an_empty_narration_reports_nothing(tmp_path: Path):
+    results = synthesize_lines([], tmp_path / "vo", voice=VoiceSpec(), provider="offline")
+    assert results == []
+    assert results.provider == "" and results.attempted == ()
+
+
+@pytest.mark.needs_ffmpeg
+def test_fallback_chain_always_ends_at_the_offline_backend():
+    """Whatever the starting point, the floor is the backend that cannot fail."""
+    assert [p.name for p in fallback_chain("offline")] == ["offline"]
+
+    chain = [p.name for p in fallback_chain(_Flaky(fail_on=99))]
+    assert chain[0] == "flaky" and chain[-1] == "offline"
+    assert len(set(chain)) == len(chain), "a backend must not be tried twice"
+
+
+@pytest.mark.needs_ffmpeg
+def test_fallback_chain_offers_the_other_available_backends(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(edge_mod, "edge_available", lambda: True)
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    names = [p.name for p in fallback_chain("elevenlabs", settings=_online_settings())]
+    assert names == ["elevenlabs", "edge", "offline"], (
+        "an explicitly named backend leads; only backends that could run follow it"
+    )
+
+
+@pytest.mark.needs_ffmpeg
+def test_fallback_chain_skips_the_network_backends_when_offline():
+    settings = Settings()
+    settings.offline = True
+    assert [p.name for p in fallback_chain("auto", settings=settings)] == ["offline"]
+
+
+# --------------------------------------------------------------------------- #
+# available() vs usable(): what a doctor must ask
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture(autouse=True)
+def _forget_probe_verdicts():
+    """Probe verdicts are cached for the process; tests must not inherit them."""
+    reset_usable_cache()
+    yield
+    reset_usable_cache()
+
+
+def _install_probeable_edge(monkeypatch: pytest.MonkeyPatch, list_voices) -> None:
+    """A fake ``edge_tts`` whose only interesting member is ``list_voices``."""
+    module = types.ModuleType("edge_tts")
+    module.list_voices = list_voices
+    monkeypatch.setitem(sys.modules, "edge_tts", module)
+    monkeypatch.setattr(edge_mod, "edge_available", lambda: True)
+
+
+@pytest.mark.needs_ffmpeg
+def test_edge_available_says_yes_where_edge_can_never_speak(monkeypatch: pytest.MonkeyPatch):
+    """The bug: ``doctor`` printed OK for edge on a box with no egress."""
+    asked: list[int] = []
+
+    async def dead_service():
+        asked.append(1)
+        raise OSError("Cannot connect to host speech.platform.bing.com:443")
+
+    _install_probeable_edge(monkeypatch, dead_service)
+    provider = EdgeTTS(settings=_online_settings())
+
+    assert provider.available() is True, "the import check cannot see the network"
+    assert provider.usable(timeout=1.0) is False, "the capability probe must"
+    assert asked == [1], "usable() has to actually ask the service"
+
+
+@pytest.mark.needs_ffmpeg
+def test_edge_usable_is_true_when_the_service_answers_and_is_cached_per_process(
+    monkeypatch: pytest.MonkeyPatch
+):
+    asked: list[int] = []
+
+    async def live_service():
+        asked.append(1)
+        return [{"Name": "en-US-GuyNeural"}]
+
+    _install_probeable_edge(monkeypatch, live_service)
+    settings = _online_settings()
+
+    assert EdgeTTS(settings=settings).usable(timeout=1.0) is True
+    assert EdgeTTS(settings=settings).usable(timeout=1.0) is True, "a fresh instance reuses the verdict"
+    assert len(asked) == 1, "the service must be probed once per process, not once per call"
+
+    assert EdgeTTS(settings=settings).usable(timeout=1.0, refresh=True) is True
+    assert len(asked) == 2, "refresh=True must re-probe"
+
+    reset_usable_cache()
+    assert EdgeTTS(settings=settings).usable(timeout=1.0) is True
+    assert len(asked) == 3
+
+
+@pytest.mark.needs_ffmpeg
+def test_edge_usable_times_out_rather_than_hanging(monkeypatch: pytest.MonkeyPatch):
+    async def never_answers():
+        await asyncio.sleep(30)
+        return ["never"]
+
+    _install_probeable_edge(monkeypatch, never_answers)
+    start = time.perf_counter()
+    assert EdgeTTS(settings=_online_settings()).usable(timeout=0.2) is False
+    assert time.perf_counter() - start < 10.0, "a diagnostic that hangs is a diagnostic nobody runs"
+
+
+@pytest.mark.needs_ffmpeg
+def test_edge_usable_survives_a_probe_that_blocks_the_event_loop(monkeypatch: pytest.MonkeyPatch):
+    """A synchronous wedge (DNS, TLS) never yields, so the bound must be outside the loop."""
+
+    def blocks_hard():
+        time.sleep(30)
+        return ["never"]
+
+    _install_probeable_edge(monkeypatch, blocks_hard)
+    start = time.perf_counter()
+    assert EdgeTTS(settings=_online_settings()).usable(timeout=0.2) is False
+    assert time.perf_counter() - start < 10.0
+
+
+def test_edge_usable_is_false_offline_without_probing(monkeypatch: pytest.MonkeyPatch):
+    def must_not_run():
+        raise AssertionError("offline mode must never touch the network")
+
+    _install_probeable_edge(monkeypatch, must_not_run)
+    settings = Settings()
+    settings.offline = True
+    assert EdgeTTS(settings=settings).usable(timeout=1.0) is False
+
+
+@pytest.mark.needs_ffmpeg
+def test_eleven_usable_checks_the_key_against_the_api(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "sk-test-not-a-real-key")
+    seen: list[tuple[str, str | None, float | None]] = []
+
+    def fake_urlopen(request, timeout=None):
+        seen.append((request.full_url, request.get_header("Xi-api-key"), timeout))
+        return _FakeResponse(b'{"subscription": {"tier": "free"}}')
+
+    monkeypatch.setattr(eleven_mod.urllib.request, "urlopen", fake_urlopen)
+    provider = ElevenLabsTTS(settings=_online_settings())
+
+    assert provider.available() is True
+    assert provider.usable(timeout=2.0) is True
+    assert seen[0][0] == eleven_mod.PROBE_URL, "the probe must not spend a synthesis"
+    assert seen[0][1] == "sk-test-not-a-real-key"
+    assert seen[0][2] == 2.0, "the probe has to carry its timeout down to the socket"
+
+    assert provider.usable(timeout=2.0) is True
+    assert len(seen) == 1, "the verdict is cached for the process"
+
+
+@pytest.mark.needs_ffmpeg
+def test_eleven_usable_is_false_for_a_key_the_api_rejects(monkeypatch: pytest.MonkeyPatch):
+    import urllib.error
+
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "sk-revoked-yesterday")
+
+    def rejected(request, timeout=None):
+        raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, _FakeBody(b"nope"))
+
+    monkeypatch.setattr(eleven_mod.urllib.request, "urlopen", rejected)
+    provider = ElevenLabsTTS(settings=_online_settings())
+    assert provider.available() is True, "a revoked key is still a non-empty string"
+    assert provider.usable(timeout=1.0) is False
+
+
+@pytest.mark.needs_ffmpeg
+def test_eleven_usable_is_cached_per_key_not_globally(monkeypatch: pytest.MonkeyPatch):
+    import urllib.error
+
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "sk-good")
+
+    def by_key(request, timeout=None):
+        if request.get_header("Xi-api-key") == "sk-good":
+            return _FakeResponse(b"{}")
+        raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, _FakeBody(b"nope"))
+
+    monkeypatch.setattr(eleven_mod.urllib.request, "urlopen", by_key)
+    assert ElevenLabsTTS(settings=_online_settings()).usable(timeout=1.0) is True
+
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "sk-bad")
+    assert ElevenLabsTTS(settings=_online_settings()).usable(timeout=1.0) is False, (
+        "a new key is a new question, not a cache hit"
+    )
+
+
+@pytest.mark.needs_ffmpeg
+def test_eleven_usable_is_false_without_a_key_and_never_calls_out(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+
+    def must_not_run(request, timeout=None):
+        raise AssertionError("no key means nothing to ask")
+
+    monkeypatch.setattr(eleven_mod.urllib.request, "urlopen", must_not_run)
+    assert ElevenLabsTTS(settings=_online_settings()).usable(timeout=1.0) is False
+
+
+@pytest.mark.needs_ffmpeg
+def test_the_offline_backend_is_always_usable():
+    assert OfflineTTS().usable() is True
+    assert provider_usable("offline") is True
+
+
+@pytest.mark.needs_ffmpeg
+def test_provider_usable_degrades_to_available_for_a_backend_without_a_probe():
+    """A third-party or test-double provider is still a valid provider."""
+    assert provider_usable(_Flaky(fail_on=99)) is True
+
+    class Unavailable(_Flaky):
+        def available(self) -> bool:
+            return False
+
+    assert provider_usable(Unavailable(fail_on=99)) is False
+
+
+def test_provider_usable_never_raises():
+    class Angry:
+        name = "angry"
+
+        def available(self) -> bool:
+            raise RuntimeError("everything is on fire")
+
+        def usable(self, *, timeout=None, refresh=False) -> bool:
+            raise RuntimeError("this too")
+
+        def synthesize(self, text, out_path, *, voice):
+            raise RuntimeError("and this")
+
+    assert provider_usable(Angry()) is False
+    assert provider_usable("no-such-backend") is False
+
+
+# --------------------------------------------------------------------------- #
+# run_bounded, the thing that keeps a probe from wedging the caller
+# --------------------------------------------------------------------------- #
+
+def test_run_bounded_returns_the_default_when_the_call_wedges():
+    start = time.perf_counter()
+    assert run_bounded(lambda: time.sleep(30) or True, 0.15, default=False) is False
+    assert time.perf_counter() - start < 5.0
+
+
+def test_run_bounded_returns_the_value_when_the_call_finishes():
+    assert run_bounded(lambda: "done", 5.0, default="timeout") == "done"
+
+
+def test_run_bounded_propagates_failures():
+    def boom():
+        raise ValueError("probe blew up")
+
+    with pytest.raises(ValueError, match="probe blew up"):
+        run_bounded(boom, 5.0, default=None)

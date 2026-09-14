@@ -24,6 +24,13 @@ Two jobs:
     sentences, its numbers and its keywords, routed by property name, so the
     result reads like an answer to the question rather than filler.
 
+A prompt is mostly *instructions*, and instruction wording must never surface as
+content -- "Write a 30-second vertical short" is not a title.  Callers therefore
+tag the thing the prompt is actually about with :func:`with_subject`, which
+appends a delimited ``[subject]`` section; when one is present every generated
+value is drawn from it alone.  Without it the older label heuristic
+(``Topic:``/``Premise:``) still applies, so existing callers are unaffected.
+
 :func:`validate_instance` is the small checker used to prove that; it is shared
 with the test-suite rather than duplicated there.
 """
@@ -40,7 +47,10 @@ from typing import Any
 from ..config import Settings
 from .base import _settings as _resolve_settings
 
-__all__ = ["HeuristicProvider", "build_instance", "validate_instance"]
+__all__ = [
+    "HeuristicProvider", "build_instance", "validate_instance",
+    "with_subject", "SUBJECT_OPEN", "SUBJECT_CLOSE",
+]
 
 #: Analysis is capped so a pathological prompt cannot make generation slow.
 _MAX_PROMPT_CHARS = 20_000
@@ -155,6 +165,62 @@ def _clean_sentence(raw: str) -> str:
     return text
 
 
+#: Delimiters wrapping the part of a prompt that names its actual subject.
+#: They are plain text so a real model reads them as a labelled section, and
+#: distinctive enough that ordinary prose never trips over them.
+SUBJECT_OPEN = "[subject]"
+SUBJECT_CLOSE = "[/subject]"
+
+_SUBJECT_RE = re.compile(
+    r"^[ \t]*\[subject\][ \t]*$\n?(?P<subject>.*?)(?:^[ \t]*\[/subject\][ \t]*$|\Z)",
+    re.IGNORECASE | re.DOTALL | re.MULTILINE,
+)
+_MARKER_RE = re.compile(r"\[/?subject\]", re.IGNORECASE)
+
+
+def with_subject(prompt: str, subject: str) -> str:
+    """Return ``prompt`` with ``subject`` appended as a delimited section.
+
+    The heuristic provider draws every generated value from that section alone,
+    so none of the surrounding instruction wording can leak into a title, a hook
+    or a beat.  Any other provider simply sees the subject restated under a
+    clear label.  An empty subject changes nothing.
+    """
+    body = _MARKER_RE.sub(" ", str(subject or "")).strip()
+    if not body:
+        return prompt or ""
+    head = (prompt or "").rstrip()
+    section = f"{SUBJECT_OPEN}\n{body}\n{SUBJECT_CLOSE}\n"
+    return f"{head}\n\n{section}" if head else section
+
+
+def _split_subject(text: str) -> tuple[str, str]:
+    """``(subject, everything else)`` for a prompt carrying a subject section."""
+    match = _SUBJECT_RE.search(text)
+    if match is None:
+        return "", text
+    subject = match.group("subject").strip()
+    if not subject:
+        return "", text
+    rest = f"{text[:match.start()]}\n{text[match.end():]}"
+    return subject, rest
+
+
+def _find_subject(raw: str) -> tuple[str, str]:
+    """Locate the subject section in a prompt of any length.
+
+    The section is appended last, so on a prompt long enough to be truncated for
+    analysis it lives in the tail rather than the head; both ends are searched
+    before giving up and falling back to the label heuristic.
+    """
+    head = raw[:_MAX_PROMPT_CHARS]
+    subject, rest = _split_subject(head)
+    if not subject and len(raw) > _MAX_PROMPT_CHARS:
+        subject, _ = _split_subject(raw[-_MAX_PROMPT_CHARS:])
+        rest = head
+    return subject[:_MAX_PROMPT_CHARS], rest[:_MAX_PROMPT_CHARS]
+
+
 def _split_payload(text: str) -> tuple[str, str]:
     """Separate instructions from payload.
 
@@ -228,8 +294,17 @@ def _topped_up(sentences: list[str], keywords: list[str], rng: random.Random) ->
 
 def _material(prompt: str, seed: int) -> _Material:
     """Split a prompt into the raw material every generated value is built from."""
-    text = (prompt or "")[:_MAX_PROMPT_CHARS]
-    payload, instructions = _split_payload(text)
+    raw = prompt or ""
+    subject, rest = _find_subject(raw)
+    if subject:
+        # An explicit subject is exclusive: a two-word topic must not be topped
+        # up out of the instructions that surround it, because "write a
+        # 30-second vertical short" then becomes the title of the video.
+        payload, instructions = subject, ""
+        text = rest
+    else:
+        text = raw[:_MAX_PROMPT_CHARS]
+        payload, instructions = _split_payload(text)
 
     # Instruction text is only material of last resort: when the caller labelled
     # a payload, the generated content comes from the payload alone.
@@ -240,10 +315,11 @@ def _material(prompt: str, seed: int) -> _Material:
     _rank_keywords(payload, 3, counts, order)
     _rank_keywords(instructions, 1, counts, order)
     keywords = sorted(counts, key=lambda w: (-counts[w], order[w]))[:_MAX_KEYWORDS]
+    from_prompt = bool(keywords)
     keywords = keywords or list(_FALLBACK_KEYWORDS)
 
     numbers: list[float] = []
-    for match in _NUMBER_RE.finditer(payload or text):
+    for match in _NUMBER_RE.finditer(payload if subject else (payload or text)):
         try:
             numbers.append(float(match.group(0)))
         except ValueError:  # pragma: no cover - regex guarantees parseability
@@ -251,10 +327,14 @@ def _material(prompt: str, seed: int) -> _Material:
         if len(numbers) >= 64:
             break
 
-    person = _proper_noun(payload) or _proper_noun(text) or _titlecase(keywords[0])
+    person = _proper_noun(payload) or ("" if subject else _proper_noun(text)) or _titlecase(keywords[0])
     rng = random.Random(seed)
+    # A subject too short to yield a sentence -- "cats" -- still has vocabulary,
+    # and the filler shells built from that vocabulary are at least *about* it.
+    # The generic fallbacks are for a prompt that carries no words at all.
+    seeds = sentences or ([] if from_prompt else list(_FALLBACK_SENTENCES))
     return _Material(
-        sentences=_topped_up(sentences or list(_FALLBACK_SENTENCES), keywords, rng),
+        sentences=_topped_up(seeds, keywords, rng),
         keywords=keywords,
         numbers=numbers,
         rng=rng,

@@ -17,6 +17,7 @@ request shape is then testable with no network at all.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import tempfile
@@ -29,13 +30,14 @@ from .. import ffmpeg
 from ..config import Settings
 from ..errors import TTSError
 from ..models import TTSResult, VoiceSpec
+from . import base
 from .base import _settings as _resolve_settings
 from .voices import resolve_voice_id
 
 log = logging.getLogger(__name__)
 
 __all__ = [
-    "ElevenLabsTTS", "API_ROOT", "DEFAULT_MODEL", "DEFAULT_VOICE_ID",
+    "ElevenLabsTTS", "API_ROOT", "PROBE_URL", "DEFAULT_MODEL", "DEFAULT_VOICE_ID",
     "build_request", "tempo_filters",
 ]
 
@@ -50,6 +52,11 @@ DEFAULT_VOICE_ID = "pNInz6obpgDQGcFmaJgB"
 
 #: Network timeout for one synthesis request, in seconds.
 DEFAULT_TIMEOUT = 60.0
+
+#: The cheapest authenticated endpoint there is: it returns the caller's own
+#: user record, so it costs no credits and proves the key is live.  Used only by
+#: the capability probe, never by a render.
+PROBE_URL = "https://api.elevenlabs.io/v1/user"
 
 #: ``atempo`` only accepts 0.5..2.0 per instance, so larger changes chain.
 _ATEMPO_MIN = 0.5
@@ -134,10 +141,61 @@ class ElevenLabsTTS:
         self.model = model
 
     def available(self) -> bool:
-        """A key is set, ffmpeg is present, and we are not running offline."""
+        """A key is set, ffmpeg is present, and we are not running offline.
+
+        A credential *presence* check, deliberately -- it is consulted on every
+        render and must not touch the network.  Whether the key is accepted is
+        :meth:`usable`.
+        """
         if self.settings.offline:
             return False
         return bool(self.settings.elevenlabs_api_key) and ffmpeg.have_ffmpeg(self.settings)
+
+    def usable(self, *, timeout: float | None = None, refresh: bool = False) -> bool:
+        """Does the key this process holds actually open the API?
+
+        :meth:`available` proves only that ``ELEVENLABS_API_KEY`` is a non-empty
+        string -- a revoked, mistyped or out-of-quota key passes it, and a
+        diagnostic that reports ``OK`` for one of those has misled the person
+        running it.  This spends one authenticated GET on :data:`PROBE_URL`
+        (the account record: no credits, no audio) bounded to ``timeout``
+        seconds, and treats any non-200 or transport failure as unusable.
+
+        Cached for the process, keyed by a fingerprint of the key and the
+        timeout, so re-keying the environment re-probes but asking twice does
+        not.  ``refresh=True`` probes again regardless.
+        """
+        if not self.available():
+            return False
+        limit = float(timeout) if timeout and timeout > 0 else float(base.USABLE_TIMEOUT)
+        key = f"elevenlabs:{_fingerprint(self.settings.elevenlabs_api_key)}:{limit:g}"
+        return base.cached_usable(key, lambda: self._probe(limit), refresh=refresh)
+
+    def _probe(self, timeout: float) -> bool:
+        """One cheap authenticated GET; ``False`` for anything but a 200."""
+        api_key = self.settings.elevenlabs_api_key
+        request = urllib.request.Request(
+            PROBE_URL,
+            headers={"xi-api-key": api_key, "Accept": "application/json"},
+            method="GET",
+        )
+
+        def _ask() -> bool:
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    return int(getattr(response, "status", 200) or 200) == 200
+            except urllib.error.HTTPError as exc:
+                with contextlib.suppress(Exception):
+                    exc.close()
+                log.debug("elevenlabs probe rejected with HTTP %s", getattr(exc, "code", "?"))
+                return False
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                log.debug("elevenlabs probe could not reach the API: %s", exc)
+                return False
+
+        # urlopen's timeout bounds each socket operation rather than the call as
+        # a whole, so the probe gets an outer bound as well.
+        return base.run_bounded(_ask, timeout + 0.5, default=False)
 
     def voice_id(self, voice: VoiceSpec | None) -> str:
         """Native ElevenLabs voice id for ``voice``."""
@@ -204,6 +262,12 @@ class ElevenLabsTTS:
             voice=spec,
             text=text,
         )
+
+
+def _fingerprint(api_key: str) -> str:
+    """A short, non-reversible tag for a key, so the probe cache can be keyed on
+    *which* key answered without ever holding the key itself."""
+    return hashlib.sha256((api_key or "").encode("utf-8", "replace")).hexdigest()[:12]
 
 
 def _decode(body: Any) -> str:

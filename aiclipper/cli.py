@@ -18,6 +18,11 @@ variable, :func:`~aiclipper.config.reset_settings` clears the settings cache, an
 the previous environment is restored when the command finishes -- so calling
 :func:`main` from a test or another program leaves no residue.
 
+:func:`validate` runs before any command does work: every enumerated option
+(caption style, chat and forum theme, voice name, overlay backend) and every
+numeric floor is checked up front, so a typo costs a line of stderr instead of a
+finished render.  The numeric floors are enforced by the parser itself.
+
 :func:`main` returns ``0`` on success, ``1`` on a handled failure (one clear line
 on stderr; a traceback only with ``-v``) and ``2`` on bad usage.  Nothing in this
 module imports an optional dependency at import time.
@@ -43,8 +48,14 @@ __all__ = [
     "PROG",
     "GLOBAL_ENV",
     "OPTIONAL_EXTRAS",
+    "MIN_COUNT",
+    "MIN_TURNS",
+    "MIN_WORDS",
+    "MIN_SECONDS",
+    "DOCTOR_TTS_TIMEOUT",
     "UsageError",
     "build_parser",
+    "validate",
     "environment_for",
     "read_script",
     "main",
@@ -75,6 +86,16 @@ OPTIONAL_EXTRAS: tuple[tuple[str, str, str], ...] = (
 )
 
 _TTS_BACKENDS = ("edge", "elevenlabs", "offline")
+
+#: Floors for the numeric options.  A degenerate value (no clips, a fifth of a
+#: second of video) is a usage error, not something to render and then explain.
+MIN_COUNT = 1
+MIN_TURNS = 1
+MIN_WORDS = 20
+MIN_SECONDS = 1.0
+
+#: Seconds ``doctor`` gives each TTS backend to prove it can synthesise.
+DOCTOR_TTS_TIMEOUT = 4.0
 
 log = logging.getLogger("aiclipper.cli")
 
@@ -186,6 +207,119 @@ def _dry_run(command: str, primary: dict[str, Any], kwargs: dict[str, Any]) -> i
     print(f"  canvas: {settings.width}x{settings.height}@{settings.fps}")
     print(f"  output-dir: {settings.output_dir}")
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# up-front validation
+# --------------------------------------------------------------------------- #
+#
+# Every enumerated option is checked before the command runs, so a typo costs a
+# line of stderr instead of minutes of rendering.  The message names the bad
+# value and lists what was allowed, and the exit code is 2 -- it is bad usage.
+
+def _bounded_int(flag: str, minimum: int) -> Callable[[str], int]:
+    """An argparse ``type`` accepting whole numbers ``>= minimum``."""
+
+    def parse(text: str) -> int:
+        try:
+            value = int(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{flag} wants a whole number, not {text!r}") from None
+        if value < minimum:
+            raise argparse.ArgumentTypeError(f"{flag} must be at least {minimum}, not {value}")
+        return value
+
+    return parse
+
+
+def _bounded_float(flag: str, minimum: float) -> Callable[[str], float]:
+    """An argparse ``type`` accepting numbers ``>= minimum`` seconds."""
+
+    def parse(text: str) -> float:
+        try:
+            value = float(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{flag} wants a number of seconds, not {text!r}") from None
+        if value < minimum:
+            raise argparse.ArgumentTypeError(
+                f"{flag} must be at least {minimum:g} second{'' if minimum == 1 else 's'}, not {value:g}"
+            )
+        return value
+
+    return parse
+
+
+def _style_key(value: str) -> str:
+    return value.strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _theme_key(value: str) -> str:
+    return value.strip().lower()
+
+
+def _check_choice(what: str, value: str | None, known: Sequence[str],
+                  normalise: Callable[[str], str]) -> None:
+    """Raise :class:`UsageError` unless ``value`` names one of ``known``."""
+    raw = (value or "").strip()
+    if not raw:
+        return
+    if normalise(raw) in known:
+        return
+    raise UsageError(f"unknown {what} {raw!r}. Available: {', '.join(known)}")
+
+
+def _check_style(value: str | None) -> None:
+    from . import captions
+
+    _check_choice("caption style", value, sorted(captions.PRESETS), _style_key)
+
+
+def _check_theme(kind: str, value: str | None) -> None:
+    from . import overlays
+
+    themes = overlays.THEMES[kind]
+    _check_choice(f"{kind} theme", value, sorted(themes), _theme_key)
+
+
+def _check_voice(flag: str, value: str | None) -> None:
+    """A voice name that will not resolve is a usage error, not a silent default."""
+    raw = (value or "").strip()
+    if not raw:
+        return
+    from .errors import TTSError
+    from .tts import voices as catalogue
+
+    try:
+        catalogue.find_voice(raw)
+    except TTSError as exc:
+        raise UsageError(f"{flag}: {_one_line(exc)} (run: {PROG} voices)") from None
+
+
+def _check_backend(value: str | None) -> None:
+    from . import overlays
+
+    _check_choice("overlay backend", value, sorted(overlays.BACKENDS), _theme_key)
+
+
+def validate(ns: argparse.Namespace) -> None:
+    """Reject every bad enumerated or degenerate value, before any work starts."""
+    command = getattr(ns, "command", "")
+    if command not in ("clip", "story", "texts", "reddit", "split"):
+        return
+
+    _check_style(getattr(ns, "style", ""))
+    _check_backend(getattr(ns, "backend", None))
+    _check_voice("--voice", getattr(ns, "voice", ""))
+    _check_voice("--reply-voice", getattr(ns, "reply_voice", ""))
+    if command == "texts":
+        _check_theme("chat", ns.theme)
+    if command == "reddit":
+        _check_theme("forum", ns.theme)
+    if command == "clip" and ns.min_duration > ns.max_duration:
+        raise UsageError(
+            f"--min {ns.min_duration:g} is longer than --max {ns.max_duration:g}; "
+            "--min must not exceed --max"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -421,11 +555,57 @@ def _chromium_report(settings: Settings) -> tuple[bool, str]:
             browser.close()
 
 
+def _tts_blocker(provider: Any, settings: Settings) -> str:
+    """Why ``provider`` cannot be routed to, when ``available()`` says no.
+
+    ``available()`` folds three different answers into one ``False`` -- the
+    package is missing, the credential is missing, or ``settings.offline``
+    forbids the network -- and reporting all three as "not installed"
+    contradicts the extras row printed a few lines above it (``OK edge-tts
+    importable``).  A diagnostic that disagrees with itself is the same kind of
+    lie the capability probe was added to stop telling, so each backend names
+    its own blocker.  Anything that is not one of our two network backends (a
+    third-party provider, a test double) keeps the plain wording.
+    """
+    from .tts.edge import EdgeTTS, edge_available
+    from .tts.eleven import ElevenLabsTTS
+
+    offline = "installed, but offline mode is set (unset AICLIP_OFFLINE)"
+    if isinstance(provider, EdgeTTS):
+        if not edge_available():
+            return "not installed (pip install 'aiclipper[tts]')"
+        return offline if settings.offline else "installed, but ffmpeg is missing"
+    if isinstance(provider, ElevenLabsTTS):
+        if not settings.elevenlabs_api_key:
+            return "no ELEVENLABS_API_KEY set"
+        return offline if settings.offline else "key set, but ffmpeg is missing"
+    return "not installed"
+
+
 def _tts_report(name: str, settings: Settings) -> tuple[bool, str]:
+    """Installed is not usable: ask the backend to prove it can really speak.
+
+    ``available()`` only says the import worked or that a key is a non-empty
+    string, which is how a machine with no route to the voice service still
+    reported ``OK tts:edge``.  :func:`aiclipper.tts.provider_usable` runs the
+    backend's own bounded, cached probe instead; it never raises.  When even
+    ``available()`` says no, :func:`_tts_blocker` names which of its several
+    conditions actually failed.
+    """
     from . import tts
 
     provider = tts.get_provider(name, settings=settings)
-    return bool(provider.available()), f"provider {provider.name}"
+    try:
+        installed = bool(provider.available())
+    except Exception:  # noqa: BLE001 - doctor reports, it does not crash
+        log.debug("tts backend %r failed its availability check", name, exc_info=True)
+        installed = False
+    usable = tts.provider_usable(provider, settings=settings, timeout=DOCTOR_TTS_TIMEOUT)
+    if usable:
+        return True, f"provider {provider.name}: installed and usable"
+    if installed:
+        return False, f"provider {provider.name}: installed, but it cannot synthesise here"
+    return False, f"provider {provider.name}: {_tts_blocker(provider, settings)}"
 
 
 def _library_report(settings: Settings) -> tuple[bool, str]:
@@ -585,11 +765,15 @@ def build_parser() -> argparse.ArgumentParser:
     # -- clip -------------------------------------------------------------- #
     clip = add("clip", "cut a long video or URL into vertical shorts")
     clip.add_argument("source", help="local file or video URL")
-    clip.add_argument("--count", type=int, default=3, metavar="N", help="how many shorts to cut")
-    clip.add_argument("--min", dest="min_duration", type=float, default=15.0, metavar="S",
-                      help="shortest acceptable clip")
-    clip.add_argument("--max", dest="max_duration", type=float, default=60.0, metavar="S",
-                      help="longest acceptable clip")
+    clip.add_argument("--count", type=_bounded_int("--count", MIN_COUNT), default=3, metavar="N",
+                      help=f"how many shorts to cut (at least {MIN_COUNT})")
+    clip.add_argument("--min", dest="min_duration", type=_bounded_float("--min", MIN_SECONDS),
+                      default=15.0, metavar="S",
+                      help=f"shortest acceptable clip, in seconds (at least {MIN_SECONDS:g}, "
+                           "and never above --max)")
+    clip.add_argument("--max", dest="max_duration", type=_bounded_float("--max", MIN_SECONDS),
+                      default=60.0, metavar="S",
+                      help=f"longest acceptable clip, in seconds (at least {MIN_SECONDS:g})")
     clip.add_argument("--style", default="clean", metavar="NAME", help="caption preset")
     clip.add_argument("--no-reframe", action="store_true", help="keep the source framing")
     clip.add_argument("--no-captions", action="store_true", help="do not burn captions")
@@ -601,7 +785,8 @@ def build_parser() -> argparse.ArgumentParser:
     source = story.add_mutually_exclusive_group()
     source.add_argument("--topic", metavar="TEXT", help="what the short is about")
     source.add_argument("--script", metavar="FILE", help="script file, or - for stdin")
-    story.add_argument("--seconds", type=int, default=35, metavar="N", help="target length")
+    story.add_argument("--seconds", type=_bounded_int("--seconds", int(MIN_SECONDS)), default=35,
+                       metavar="N", help=f"target length in seconds (at least {int(MIN_SECONDS)})")
     story.add_argument("--voice", default="", metavar="NAME", help="catalogue voice name or tag query")
     story.add_argument("--background", metavar="NAME", help="library background name or path")
     story.add_argument("--music", metavar="NAME", help="library music name or path")
@@ -621,7 +806,8 @@ def build_parser() -> argparse.ArgumentParser:
     texts.add_argument("--background", metavar="NAME", help="library background name or path")
     texts.add_argument("--music", metavar="NAME", help="library music name or path")
     texts.add_argument("--backend", choices=["chromium", "pillow"], help="overlay renderer")
-    texts.add_argument("--turns", type=int, default=10, metavar="N", help="messages to generate")
+    texts.add_argument("--turns", type=_bounded_int("--turns", MIN_TURNS), default=10, metavar="N",
+                       help=f"messages to generate (at least {MIN_TURNS})")
     texts.add_argument("--captions", action="store_true", help="also burn captions (off by default)")
     texts.add_argument("--style", default="clean", metavar="NAME", help="caption preset for --captions")
     texts.add_argument("--out", metavar="FILE", help="output file")
@@ -635,8 +821,11 @@ def build_parser() -> argparse.ArgumentParser:
     reddit.add_argument("--background", metavar="NAME", help="library background name or path")
     reddit.add_argument("--music", metavar="NAME", help="library music name or path")
     reddit.add_argument("--style", default="clean", metavar="NAME", help="caption preset")
-    reddit.add_argument("--card-seconds", type=float, metavar="S", help="how long the card stays up")
-    reddit.add_argument("--words", type=int, default=180, metavar="N", help="length of the story")
+    reddit.add_argument("--card-seconds", type=_bounded_float("--card-seconds", MIN_SECONDS),
+                        metavar="S",
+                        help=f"how long the card stays up (at least {MIN_SECONDS:g} second)")
+    reddit.add_argument("--words", type=_bounded_int("--words", MIN_WORDS), default=180, metavar="N",
+                        help=f"length of the story in words (at least {MIN_WORDS})")
     reddit.add_argument("--backend", choices=["chromium", "pillow"], help="overlay renderer")
     reddit.add_argument("--no-captions", action="store_true", help="do not burn captions")
     reddit.add_argument("--out", metavar="FILE", help="output file")
@@ -650,7 +839,8 @@ def build_parser() -> argparse.ArgumentParser:
     split.add_argument("--voice", default="", metavar="NAME", help="narration voice")
     split.add_argument("--style", default="clean", metavar="NAME", help="caption preset")
     split.add_argument("--music", metavar="NAME", help="library music name or path")
-    split.add_argument("--seconds", type=float, metavar="S", help="trim the result to this length")
+    split.add_argument("--seconds", type=_bounded_float("--seconds", MIN_SECONDS), metavar="S",
+                       help=f"trim the result to this length (at least {MIN_SECONDS:g} second)")
     split.add_argument("--no-captions", action="store_true", help="do not burn captions")
     split.add_argument("--no-reframe", action="store_true", help="keep the source framing")
     split.add_argument("--out", metavar="FILE", help="output file")
@@ -694,6 +884,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         with _applied(environment_for(ns)):
+            validate(ns)
             log.debug("running %s with %s", ns.command, vars(ns))
             return int(ns.func(ns))
     except UsageError as exc:

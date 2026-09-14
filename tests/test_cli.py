@@ -177,7 +177,7 @@ def test_texts_passes_every_argument(tmp_path: Path, monkeypatch: pytest.MonkeyP
     run = patch_pipeline(monkeypatch, "texts", result_for(tmp_path, kind="texts"))
 
     code = main([
-        "texts", "--topic", "a missed train", "--theme", "midnight", "--voice", "narrator_female",
+        "texts", "--topic", "a missed train", "--theme", "sunset", "--voice", "narrator_female",
         "--reply-voice", "narrator_deep", "--background", "ember_mist", "--music", "quiet_bed",
         "--backend", "pillow", "--turns", "6", "--captions", "--style", "boxed",
         "--out", str(tmp_path / "train.mp4"),
@@ -187,7 +187,7 @@ def test_texts_passes_every_argument(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert run.kwargs == {
         "topic": "a missed train",
         "script": None,
-        "theme": "midnight",
+        "theme": "sunset",
         "voice": "narrator_female",
         "reply_voice": "narrator_deep",
         "background": "ember_mist",
@@ -754,3 +754,339 @@ def test_callable_entry_point_is_exported() -> None:
 
     assert isinstance(cli.main, Callable)
     assert "main" in cli.__all__
+
+
+# --------------------------------------------------------------------------- #
+# up-front validation of every enumerated option
+# --------------------------------------------------------------------------- #
+
+
+def explode_pipeline(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    """Replace a pipeline ``run`` with a landmine: reaching it fails the test."""
+
+    def landmine(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(f"{name}.run was reached; validation should have rejected the arguments")
+
+    monkeypatch.setattr(f"aiclipper.pipelines.{name}.run", landmine)
+
+
+@pytest.mark.parametrize(
+    ("argv", "pipeline", "needle"),
+    [
+        (["texts", "--topic", "x", "--theme", "nosuch"], "texts", "unknown chat theme 'nosuch'"),
+        (["reddit", "--topic", "x", "--theme", "nosuch"], "reddit", "unknown forum theme 'nosuch'"),
+        (["story", "--topic", "x", "--style", "nosuch"], "story", "unknown caption style 'nosuch'"),
+        (["clip", "a.mp4", "--style", "nosuch"], "clip", "unknown caption style 'nosuch'"),
+        (["split", "a.mp4", "--style", "nosuch"], "split", "unknown caption style 'nosuch'"),
+        (["texts", "--topic", "x", "--style", "nosuch"], "texts", "unknown caption style 'nosuch'"),
+        (["story", "--topic", "x", "--voice", "nosuchvoice"], "story", "unknown voice 'nosuchvoice'"),
+        (["reddit", "--topic", "x", "--voice", "nosuchvoice"], "reddit", "unknown voice 'nosuchvoice'"),
+        (["split", "a.mp4", "--voice", "nosuchvoice"], "split", "unknown voice 'nosuchvoice'"),
+        (["texts", "--topic", "x", "--reply-voice", "nope"], "texts", "--reply-voice"),
+    ],
+)
+def test_unknown_enumerated_value_exits_two_before_the_pipeline_runs(
+    argv: list[str], pipeline: str, needle: str, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    explode_pipeline(monkeypatch, pipeline)
+
+    assert main(argv) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert needle in captured.err
+    assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize(
+    ("argv", "known"),
+    [
+        (["texts", "--topic", "x", "--theme", "nosuch"], lambda: sorted(_chat_themes())),
+        (["reddit", "--topic", "x", "--theme", "nosuch"], lambda: sorted(_forum_themes())),
+        (["story", "--topic", "x", "--style", "nosuch"], lambda: sorted(_style_names())),
+    ],
+)
+def test_the_rejection_lists_every_valid_value(
+    argv: list[str], known: Callable[[], list[str]], monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    explode_pipeline(monkeypatch, argv[0])
+
+    assert main(argv) == 2
+    err = capsys.readouterr().err
+    for name in known():
+        assert name in err, f"{name!r} missing from the rejection message"
+
+
+def _chat_themes() -> list[str]:
+    from aiclipper.overlays import CHAT_THEMES
+
+    return list(CHAT_THEMES)
+
+
+def _forum_themes() -> list[str]:
+    from aiclipper.overlays import FORUM_THEMES
+
+    return list(FORUM_THEMES)
+
+
+def _style_names() -> list[str]:
+    from aiclipper.captions import PRESETS
+
+    return list(PRESETS)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["texts", "--topic", "x", "--theme", "CLASSIC"],
+        ["texts", "--topic", "x", "--theme", " mint "],
+        ["story", "--topic", "x", "--style", "bold-yellow"],
+        ["story", "--topic", "x", "--voice", "narrator_deep"],
+        ["story", "--topic", "x", "--voice", "british female"],
+        ["story", "--topic", "x", "--voice", "edge:en-GB-RyanNeural"],
+        ["story", "--topic", "x"],
+    ],
+)
+def test_validation_lets_good_values_through(
+    argv: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    name = argv[0]
+    patch_pipeline(monkeypatch, name, result_for(tmp_path, kind=name))
+    assert main(argv) == 0
+
+
+def test_a_bad_theme_is_rejected_even_under_dry_run(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    explode_pipeline(monkeypatch, "texts")
+    assert main(["texts", "--topic", "x", "--theme", "nosuch", "--dry-run"]) == 2
+    assert "unknown chat theme" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# degenerate numbers are a usage error, not a pointless render
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("argv", "pipeline", "needle"),
+    [
+        (["clip", "a.mp4", "--count", "0"], "clip", "--count must be at least 1"),
+        (["clip", "a.mp4", "--count", "-3"], "clip", "--count must be at least 1"),
+        (["clip", "a.mp4", "--min", "0"], "clip", "--min must be at least 1"),
+        (["clip", "a.mp4", "--max", "0.5"], "clip", "--max must be at least 1"),
+        (["clip", "a.mp4", "--min", "60", "--max", "10"], "clip", "--min must not exceed --max"),
+        (["split", "a.mp4", "--seconds", "0.05"], "split", "--seconds must be at least 1"),
+        (["split", "a.mp4", "--seconds", "0"], "split", "--seconds must be at least 1"),
+        (["story", "--topic", "x", "--seconds", "0"], "story", "--seconds must be at least 1"),
+        (["texts", "--topic", "x", "--turns", "0"], "texts", "--turns must be at least 1"),
+        (["reddit", "--topic", "x", "--words", "3"], "reddit", "--words must be at least 20"),
+        (["reddit", "--topic", "x", "--card-seconds", "0.2"], "reddit", "--card-seconds must be at least 1"),
+    ],
+)
+def test_degenerate_numbers_exit_two_before_the_pipeline_runs(
+    argv: list[str], pipeline: str, needle: str, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    explode_pipeline(monkeypatch, pipeline)
+
+    assert main(argv) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert needle in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_the_floors_are_documented_in_the_help(capsys) -> None:
+    from aiclipper.cli import MIN_COUNT, MIN_SECONDS, MIN_TURNS, MIN_WORDS
+
+    assert main(["clip", "--help"]) == 0
+    clip_help = capsys.readouterr().out
+    assert f"at least {MIN_COUNT}" in clip_help
+    assert f"at least {MIN_SECONDS:g}" in clip_help
+
+    assert main(["texts", "--help"]) == 0
+    assert f"at least {MIN_TURNS}" in capsys.readouterr().out
+
+    assert main(["reddit", "--help"]) == 0
+    assert f"at least {MIN_WORDS}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("argv", "pipeline"),
+    [
+        (["clip", "a.mp4", "--count", "1", "--min", "1", "--max", "1"], "clip"),
+        (["split", "a.mp4", "--seconds", "1"], "split"),
+        (["reddit", "--topic", "x", "--words", "20"], "reddit"),
+    ],
+)
+def test_the_floor_itself_is_accepted(
+    argv: list[str], pipeline: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = result_for(tmp_path, kind=pipeline)
+    patch_pipeline(monkeypatch, pipeline, [result] if pipeline == "clip" else result)
+    assert main(argv) == 0
+
+
+# --------------------------------------------------------------------------- #
+# doctor: installed is not usable
+# --------------------------------------------------------------------------- #
+
+
+class FakeProvider:
+    def __init__(self, name: str, available: bool) -> None:
+        self.name = name
+        self._available = available
+
+    def available(self) -> bool:
+        return self._available
+
+    def synthesize(self, text: str, out_path: Path, *, voice: Any) -> Any:  # pragma: no cover
+        raise AssertionError("doctor must never synthesise")
+
+
+def patch_tts(monkeypatch: pytest.MonkeyPatch, usable: dict[str, bool], available: dict[str, bool]) -> None:
+    import aiclipper.tts as tts
+
+    monkeypatch.setattr(
+        tts, "get_provider", lambda name=None, **kw: FakeProvider(str(name), available[str(name)])
+    )
+    monkeypatch.setattr(tts, "provider_usable", lambda provider, **kw: usable[provider.name])
+
+
+def test_doctor_separates_installed_from_usable(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    monkeypatch.setattr("aiclipper.cli._chromium_report", lambda settings: (True, "chromium 1.2.3"))
+    patch_tts(
+        monkeypatch,
+        usable={"edge": False, "elevenlabs": False, "offline": True},
+        available={"edge": True, "elevenlabs": False, "offline": True},
+    )
+
+    assert main(["doctor"]) == 0
+
+    rows = {
+        line.split()[1]: line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith(("OK", "MISSING"))
+    }
+    # importable, but no route to the service: a MISSING row that says why.
+    assert rows["tts:edge"].startswith("MISSING")
+    assert "installed" in rows["tts:edge"]
+    assert "cannot synthesise" in rows["tts:edge"]
+    # not installed at all: a different reason, still MISSING.
+    assert rows["tts:elevenlabs"].startswith("MISSING")
+    assert "not installed" in rows["tts:elevenlabs"]
+    # the one that really works.
+    assert rows["tts:offline"].startswith("OK")
+    assert "usable" in rows["tts:offline"]
+
+
+def test_doctor_uses_the_capability_probe_not_just_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The row must follow ``provider_usable``, not ``available()``."""
+    import aiclipper.tts as tts
+    from aiclipper.cli import _tts_report
+
+    monkeypatch.setattr(tts, "get_provider", lambda name=None, **kw: FakeProvider(str(name), True))
+    asked: list[str] = []
+
+    def probe(provider: Any, **kwargs: Any) -> bool:
+        asked.append(provider.name)
+        return False
+
+    monkeypatch.setattr(tts, "provider_usable", probe)
+
+    ok, detail = _tts_report("edge", get_settings())
+    assert asked == ["edge"]
+    assert ok is False
+    assert "installed" in detail and "cannot synthesise" in detail
+
+
+def test_doctor_survives_a_tts_backend_that_explodes(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    import aiclipper.tts as tts
+
+    def boom(name: Any = None, **kwargs: Any) -> Any:
+        raise RuntimeError("tts backend exploded")
+
+    monkeypatch.setattr("aiclipper.cli._chromium_report", lambda settings: (True, "chromium 1.2.3"))
+    monkeypatch.setattr(tts, "get_provider", boom)
+
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out.replace("  ", " ")
+    assert "MISSING tts:edge" in out
+    assert "tts backend exploded" in out
+
+
+def test_doctor_names_the_real_blocker_instead_of_saying_not_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A backend held back by offline mode or a missing key is not "not installed".
+
+    ``available()`` returns ``False`` for three different reasons; reporting all
+    of them as "not installed" contradicts the extras rows above, which say
+    ``edge-tts`` imported fine.
+    """
+    import aiclipper.tts as tts
+    from aiclipper.cli import _tts_report
+    from aiclipper.tts.edge import EdgeTTS
+
+    monkeypatch.setattr(tts, "provider_usable", lambda provider, **kwargs: False)
+    monkeypatch.setattr("aiclipper.tts.edge.edge_available", lambda: True)
+
+    # AICLIP_OFFLINE is set by the autouse fixture: edge is installed, just fenced off.
+    settings = get_settings()
+    assert settings.offline
+    assert isinstance(tts.get_provider("edge", settings=settings), EdgeTTS)
+    ok, detail = _tts_report("edge", settings)
+    assert ok is False
+    assert "installed" in detail and "offline" in detail
+    assert "not installed" not in detail
+
+    # No key is its own reason, and never "not installed" either.
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    ok, detail = _tts_report("elevenlabs", settings)
+    assert ok is False
+    assert "ELEVENLABS_API_KEY" in detail
+    assert "not installed" not in detail
+
+    # The package genuinely absent still reads as "not installed".
+    monkeypatch.setattr("aiclipper.tts.edge.edge_available", lambda: False)
+    ok, detail = _tts_report("edge", settings)
+    assert ok is False
+    assert "not installed" in detail
+
+
+@pytest.mark.needs_ffmpeg
+def test_doctor_still_exits_zero_with_working_ffmpeg_and_a_dead_backend(
+    monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    monkeypatch.setattr("aiclipper.cli._chromium_report", lambda settings: (True, "chromium 1.2.3"))
+    patch_tts(
+        monkeypatch,
+        usable={"edge": False, "elevenlabs": False, "offline": False},
+        available={"edge": True, "elevenlabs": True, "offline": True},
+    )
+
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "core ok" in out
+    assert "MISSING tts:offline" in out.replace("  ", " ")
+
+
+def test_validate_rejects_an_unknown_overlay_backend() -> None:
+    """The parser's ``choices`` catch this first; ``validate`` is the backstop."""
+    from aiclipper.cli import UsageError, validate
+
+    ns = build_parser().parse_args(["texts", "--topic", "x", "--backend", "pillow"])
+    validate(ns)  # a good backend passes
+
+    ns.backend = "webgl"
+    with pytest.raises(UsageError) as excinfo:
+        validate(ns)
+    assert "unknown overlay backend 'webgl'" in str(excinfo.value)
+    assert "chromium" in str(excinfo.value) and "pillow" in str(excinfo.value)
+
+
+def test_validate_ignores_the_catalogue_commands() -> None:
+    """``voices``/``styles``/``assets``/``doctor`` carry none of these options."""
+    from aiclipper.cli import validate
+
+    for argv in (["voices"], ["styles"], ["assets"], ["doctor"]):
+        validate(build_parser().parse_args(argv))
