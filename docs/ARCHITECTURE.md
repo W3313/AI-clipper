@@ -181,7 +181,8 @@ class TTSProvider(Protocol):
     def synthesize(self, text: str, out_path: Path, *, voice: VoiceSpec) -> TTSResult: ...
 def get_provider(name: str | None = None, *, settings=None) -> TTSProvider
 def synthesize_lines(lines: Sequence[str], out_dir: Path, *, voice: VoiceSpec,
-                     provider=None, gap: float = 0.18) -> list[TTSResult]
+                     provider=None, gap: float = 0.18, settings=None,
+                     fallback: bool = True) -> NarrationResults
 ```
 `tts/edge.py` (`edge-tts`, free, gives WordBoundary events -> fill `TTSResult.words`),
 `tts/eleven.py` (`ELEVENLABS_API_KEY`, REST via urllib, words left `None`),
@@ -211,11 +212,13 @@ Without OpenCV installed, `track` must transparently return `center_crop`.
 ### `captions.py`
 ```python
 PRESETS: dict[str, CaptionStyle]                       # >= 16 named looks
-def group_words(words: Sequence[Word], style: CaptionStyle) -> list[CaptionCue]
+def group_words(words: Sequence[Word], style: CaptionStyle, *,
+                hold: float = HOLD_SECONDS, gap_split: float = GAP_SPLIT) -> list[CaptionCue]
 def write_ass(cues: Sequence[CaptionCue], out_path: Path, *, style: CaptionStyle,
               width: int, height: int) -> Path
 def build(words: Sequence[Word], out_path: Path, *, style: str | CaptionStyle = "clean",
-          width: int = 1080, height: int = 1920) -> Path
+          width: int = 1080, height: int = 1920,
+          hold: float = HOLD_SECONDS, gap_split: float = GAP_SPLIT) -> Path
 def get_style(name: str | CaptionStyle) -> CaptionStyle
 ```
 Write ASS v4.00+ by hand (no library). Colours convert to `&HAABBGGRR`.
@@ -233,7 +236,8 @@ handwritten, shadow_deep, tiktok_white, podcast_bar.
 @dataclass
 class OverlayImage:  # path: Path, width: int, height: int, index: int
 def render_chat(script: ChatScript, out_dir: Path, *, width: int, height: int,
-                settings=None, backend: str | None = None) -> list[OverlayImage]
+                settings=None, backend: str | None = None,
+                header_state: bool = False) -> list[OverlayImage]
 def render_forum_card(post: RedditPost, out_path: Path, *, width: int, height: int,
                       settings=None, backend: str | None = None) -> OverlayImage
 def available_backends(settings=None) -> list[str]
@@ -247,14 +251,23 @@ Two backends: `chromium` (Playwright -> `templates/chat.html` + `chat.css`,
 respecting `settings.chromium` / `PLAYWRIGHT_BROWSERS_PATH`) and `pillow`
 (pure-Python, always available). `available_backends` reports what will work;
 `backend=None` prefers chromium and silently falls back to pillow.
-Original visual design only -- see hard rule 6.
+`header_state=True` prepends a chrome-only state so a caller can hold it from
+`t=0` instead of opening on a bare background; it shifts every message state by
+one, so map states by the documented indices, not by position.
+Themes are single-sourced as data in `overlays.py` and consumed by BOTH backends,
+so a silent fallback from chromium to pillow does not change how the video looks.
+Original visual design only -- see hard rule 6. That extends to layout grammar,
+not just colour: the story card must not reproduce the prefixes, iconography or
+arrangement that identify a specific real service.
 
 ### `render.py`
 ```python
 def render(timeline: Timeline, out_path: Path, *, options: RenderOptions | None = None,
-           settings=None, log_path: Path | None = None, dry_run: bool = False) -> RenderResult
-def build_command(timeline: Timeline, out_path: Path, *,
-                  options=None, settings=None, workdir: Path | None = None) -> list[str]
+           settings=None, log_path: Path | None = None, dry_run: bool = False,
+           loudness_target: float | None = DEFAULT_LOUDNESS_TARGET) -> RenderResult
+def build_command(timeline: Timeline, out_path: Path, *, options=None, settings=None,
+                  workdir: Path | None = None,
+                  loudness_target: float | None = DEFAULT_LOUDNESS_TARGET) -> list[str]
 ```
 Builds one ffmpeg invocation with a `-filter_complex` graph:
 * base canvas `color=c=<background>:s=WxH:r=FPS:d=DURATION`
@@ -271,6 +284,12 @@ Builds one ffmpeg invocation with a `-filter_complex` graph:
 * subtitles burned last: `subtitles=<escaped ass path>` (pass `fontsdir` when set)
 * output: `-c:v <codec> -preset -crf -pix_fmt`, `-c:a aac -b:a`, `-movflags +faststart`,
   `-r fps`, `-t duration`, `-shortest` never (explicit `-t` instead)
+* loudness: normalise the finished mix toward `loudness_target` LUFS (default
+  `DEFAULT_LOUDNESS_TARGET`) with the limiter downstream of it, leaving genuine
+  silence silent and peaks under `LOUDNESS_TRUE_PEAK`; `None` disables it
+Scratch files the renderer generates for itself -- sendcmd scripts, intermediates,
+command logs -- belong under `settings.work_dir`, keyed so concurrent renders
+cannot collide. The output directory receives the finished file and nothing else.
 Call `timeline.validate()` first and raise `RenderError` listing every problem.
 `dry_run` returns the `RenderResult` with the command and no ffmpeg execution.
 Use `ffmpeg.escape_filter_path` for every path inside the graph.
