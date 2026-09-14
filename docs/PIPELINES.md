@@ -149,7 +149,7 @@ launches, and the asset library size -- each as an OK/MISSING line.
 
 ## Tests
 
-`tests/test_pipelines.py` and `tests/test_cli.py`. Everything must pass offline
+`tests/test_pipeline_*.py` (one per workflow) and `tests/test_cli.py`. Everything must pass offline
 with the heuristic LLM provider and the offline TTS provider. Keep renders tiny
 (set `AICLIP_WIDTH=180`, `AICLIP_HEIGHT=320`, short durations). Cover at least:
 each pipeline end-to-end producing a probe-able file of roughly the expected

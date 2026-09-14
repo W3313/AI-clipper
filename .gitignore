@@ -23,3 +23,6 @@ assets/music/*
 !assets/**/*.json
 .env
 models/
+
+# generated asset manifest (indexes ignored media)
+assets/library.json
