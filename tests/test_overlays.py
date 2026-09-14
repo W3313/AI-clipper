@@ -95,8 +95,8 @@ def long_conversation(count: int = 16) -> ChatScript:
 
 def a_post(**kw) -> RedditPost:
     data = dict(
-        community="r/nightshift",
-        author="u/quietcorridor",
+        community="Nightshift",
+        author="quietcorridor",
         title="My neighbour keeps leaving notes in my mailbox and one had my handwriting",
         body="I moved in six months ago. The first note said welcome. The second listed the exact "
              "hours I leave for work, which was strange enough to make me change my route.",
@@ -134,7 +134,26 @@ def test_helpers_format_counts_and_initials():
     assert overlays._short_count(-1_500) == "-1.5k"
     assert overlays._short_count(0) == "0"
     assert overlays._initials("Mara Quinn") == "MQ"
+    assert overlays._badge_letter("Nightshift") == "N"
     assert overlays._badge_letter("r/nightshift") == "N"
+
+
+@pytest.mark.parametrize(
+    "supplied, plain, line",
+    [
+        ("r/nightshift", "nightshift", "by nightshift"),
+        ("/r/Nightshift", "Nightshift", "by Nightshift"),
+        ("u/quietcorridor", "quietcorridor", "by quietcorridor"),
+        ("/U/Quiet", "Quiet", "by Quiet"),
+        ("Nightshift", "Nightshift", "by Nightshift"),
+        ("  spaced  ", "spaced", "by spaced"),
+        ("", "", ""),
+    ],
+)
+def test_the_card_labels_its_own_fields(supplied, plain, line):
+    """Hard rule 6: no "r/"/"u/" handle grammar borrowed from a real forum."""
+    assert overlays.plain_name(supplied) == plain
+    assert overlays.byline(supplied) == line
 
 
 # --------------------------------------------------------------------------- #
@@ -235,6 +254,91 @@ def test_forum_card_renders_with_opaque_content(tmp_path: Path):
     assert abs(middle - SMALL[1] // 2) < SMALL[1] * 0.12
     # side margins stay clear of the card itself (only the soft drop shadow reaches them)
     assert alpha[:, : SMALL[0] // 20].max() < 160
+
+
+def _mask_of(path: Path, color: str, tol: int = 12) -> np.ndarray:
+    want = np.array(overlays._hex_rgb(color), dtype=np.int16)
+    with Image.open(path) as img:
+        arr = np.array(img).astype(np.int16)
+    return (np.abs(arr[..., :3] - want).max(axis=2) <= tol) & (arr[..., 3] > 200)
+
+
+def _runs(flags: np.ndarray) -> list[tuple[int, int]]:
+    """``[True, True, False, True]`` -> ``[(0, 2), (3, 4)]``."""
+    out: list[tuple[int, int]] = []
+    start: int | None = None
+    for i, on in enumerate(list(flags) + [False]):
+        if on and start is None:
+            start = i
+        elif not on and start is not None:
+            out.append((start, i))
+            start = None
+    return out
+
+
+def test_a_site_prefix_is_never_drawn_on_the_card(tmp_path: Path):
+    """Defect: the card printed "r/x" and "u/y" -- one real forum's handle
+    grammar.  A supplied prefix is now stripped, so both render identically."""
+    prefixed = overlays.render_forum_card(
+        a_post(community="r/nightshift", author="u/quietcorridor"),
+        tmp_path / "prefixed.png", width=SMALL[0], height=SMALL[1], backend="pillow")
+    plain = overlays.render_forum_card(
+        a_post(community="nightshift", author="quietcorridor"),
+        tmp_path / "plain.png", width=SMALL[0], height=SMALL[1], backend="pillow")
+
+    with Image.open(prefixed.path) as a, Image.open(plain.path) as b:
+        assert np.array_equal(np.array(a), np.array(b))
+    # and the byline really is drawn -- an authorless card has none of its ink
+    bare = overlays.render_forum_card(a_post(author=""), tmp_path / "bare.png",
+                                      width=SMALL[0], height=SMALL[1], backend="pillow")
+    ink = overlays.FORUM_THEMES["dark"].meta_fg
+    assert _mask_of(bare.path, ink).sum() < _mask_of(plain.path, ink).sum()
+
+
+def test_the_engagement_marks_are_our_own_geometry(tmp_path: Path):
+    """The upvote triangle is gone: the score mark is three rising bars and the
+    replies mark two stacked bars, both of our own design."""
+    theme = overlays.FORUM_THEMES["dark"]
+    card = overlays.render_forum_card(a_post(), tmp_path / "marks.png",
+                                      width=CANVAS[0], height=CANVAS[1], backend="pillow")
+    fm = overlays._forum_metrics(theme, *CANVAS)
+
+    # the chip row sits one card padding above the bottom edge of the card
+    card_rows = np.nonzero(_mask_of(card.path, theme.card_bg).any(axis=1))[0]
+    strip = slice(card_rows.max() - fm.pad - fm.chip_h, card_rows.max() - fm.pad)
+
+    accent = _mask_of(card.path, theme.accent)[strip]
+    bars = _runs(accent.any(axis=0))
+    assert len(bars) == 3, f"score mark is not three bars: {bars}"
+    heights = [int(accent[:, a:b].any(axis=1).sum()) for a, b in bars]
+    assert heights[0] < heights[1] < heights[2], f"bars do not rise: {heights}"
+    bottoms = [int(np.nonzero(accent[:, a:b].any(axis=1))[0].max()) for a, b in bars]
+    assert max(bottoms) - min(bottoms) <= 2, f"bars are not bottom aligned: {bottoms}"
+
+    # the replies mark leads the second chip, in the quiet chip colour
+    chips = _runs(_mask_of(card.path, theme.chip_bg)[strip].any(axis=0))
+    assert len(chips) == 2, f"expected two count chips: {chips}"
+    left = chips[1][0] + fm.chip_pad
+    chip = _mask_of(card.path, theme.chip_fg)[strip][:, left:left + fm.mark_w]
+    lanes = _runs(chip.any(axis=1))
+    assert len(lanes) == 2, f"replies mark is not two stacked bars: {lanes}"
+    widths = [int(chip[a:b].any(axis=0).sum()) for a, b in lanes]
+    assert widths[1] < widths[0], f"the lower reply bar should be shorter: {widths}"
+
+
+def test_the_forum_template_carries_no_borrowed_iconography():
+    css, html = _css("forum.css"), (overlays.TEMPLATE_DIR / "forum.html").read_text(encoding="utf-8")
+    for gone in (".arrow", ".speech", "#author"):
+        assert gone not in css and gone not in html, f"{gone} is still in the forum template"
+    assert "arrow" not in html and "speech" not in html
+    # the mark geometry is data in overlays.py; the stylesheet only echoes it
+    for left, height in overlays._SCORE_BARS:
+        assert left == 0.0 or f"{left:.2f}" in css
+        assert height == 1.0 or f"{height:.2f}" in css
+    for top, width in overlays._REPLY_BARS:
+        assert f"{top:.2f}" in css
+        assert width == 1.0 or f"{width:.2f}" in css
+    assert f"{overlays._SCORE_BAR_W:.2f}" in css and f"{overlays._REPLY_BAR_H:.2f}" in css
 
 
 def test_forum_card_handles_a_missing_body_and_huge_counts(tmp_path: Path):

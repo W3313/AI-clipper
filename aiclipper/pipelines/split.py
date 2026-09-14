@@ -47,6 +47,7 @@ from .. import render as render_module
 from ..config import Settings, get_settings
 from ..errors import IngestError
 from ..models import (
+    CaptionStyle,
     CropPath,
     MediaInfo,
     ProjectResult,
@@ -68,9 +69,13 @@ __all__ = [
     "TAIL_SECONDS",
     "MUSIC_GAIN_DB",
     "MIN_RENDERABLE",
+    "CAPTION_LINES",
+    "CAPTION_CLEARANCE",
+    "CAPTION_MIN_MARGIN_V",
     "Pane",
     "pane_rects",
     "narration_lines",
+    "caption_style_clear_of_seam",
     "run",
 ]
 
@@ -90,6 +95,17 @@ MUSIC_GAIN_DB = -22.0
 
 #: A timeline shorter than this is not worth an encode.
 MIN_RENDERABLE = 0.2
+
+#: Lines a caption group is assumed to wrap to when reserving room for it --
+#: the same working worst case :mod:`aiclipper.pipelines.texts` reserves.
+CAPTION_LINES = 3
+
+#: Clear air kept between the pane seam and the top of the caption block, in
+#: caption reference pixels.
+CAPTION_CLEARANCE = 24
+
+#: Captions are never pushed closer to the bottom edge than this.
+CAPTION_MIN_MARGIN_V = 90
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?…])\s+")
 
@@ -146,6 +162,39 @@ def pane_rects(width: int, height: int) -> tuple[Pane, Pane]:
 # --------------------------------------------------------------------------- #
 # narration text
 # --------------------------------------------------------------------------- #
+
+def caption_style_clear_of_seam(
+    style: CaptionStyle | None, *, width: int, height: int
+) -> CaptionStyle | None:
+    """Keep a centred preset off the seam between the two panes.
+
+    The panes are exact halves, so the seam runs along the middle of the canvas
+    -- which is precisely where a ``position="center"`` preset puts its text.
+    Seven of the sixteen presets are centred, ``clean`` (this pipeline's own
+    default) among them, so the default render used to slice every caption in
+    half along the pane edge.
+
+    Such a preset is re-seated into the bottom pane, which is the filler one:
+    the text lands on quiet pixels instead of across the join, and the top pane
+    -- the clip the user actually came for -- is left alone.  A preset that is
+    already anchored top or bottom is returned untouched.
+    """
+    if style is None or style.position != "center":
+        return style
+
+    _, play_h = common.caption_resolution(width, height)
+    seam = play_h / 2.0
+    block = style.font_size * 1.32 * CAPTION_LINES + CAPTION_CLEARANCE
+    # margin_v is measured up from the bottom edge, so the block clears the seam
+    # while its bottom stays at most this far up.
+    allowed = int(play_h - seam - block)
+    if allowed < CAPTION_MIN_MARGIN_V:
+        log.warning("split: the caption block is taller than a pane; captions may cross the seam")
+    # Centre the block in the lower pane when there is room for it.
+    margin_v = max(CAPTION_MIN_MARGIN_V, min(int(seam / 2.0), allowed))
+    log.debug("split: centred captions re-seated into the bottom pane (margin_v=%d)", margin_v)
+    return replace(style, position="bottom", margin_v=margin_v)
+
 
 def narration_lines(text: str | None) -> list[str]:
     """Break narration text into the lines the speech backend speaks one by one.
@@ -480,7 +529,9 @@ def run(
         )
 
     timeline.subtitles = common.caption_track(
-        words, work / "captions", style=caption_style, width=width, height=height,
+        words, work / "captions",
+        style=caption_style_clear_of_seam(caption_style, width=width, height=height),
+        width=width, height=height,
         enabled=captions and bool(words), settings=s,
     )
 

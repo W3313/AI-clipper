@@ -332,10 +332,16 @@ class ChatScript:
 
 @dataclass
 class RedditPost:
-    """A forum-style story card (original styling, not a site clone)."""
+    """A forum-style story card (original styling, not a site clone).
 
-    community: str = "r/stories"
-    author: str = "u/anonymous"
+    ``community`` and ``author`` are plain, unprefixed names: this project's
+    card labels its own fields (a community name, a ``by <author>`` byline)
+    instead of borrowing another site's ``r/``/``u/`` handle grammar.  Callers
+    may still pass anything -- the overlay strips a borrowed prefix for display.
+    """
+
+    community: str = "Stories"
+    author: str = "anonymous"
     title: str = ""
     body: str = ""
     upvotes: int = 0

@@ -291,19 +291,40 @@ def test_script_from_stdin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert run.kwargs["script"] == "Alex: hey\nme: hey back\n"
 
 
-def test_missing_script_file_is_a_handled_failure(tmp_path: Path, capsys) -> None:
-    code = main(["story", "--script", str(tmp_path / "nope.txt")])
+def test_missing_script_file_is_a_usage_error(tmp_path: Path, capsys) -> None:
+    """A bad --script is bad input, so it exits 2 like every other bad input."""
+    missing = tmp_path / "nope.txt"
+    code = main(["story", "--script", str(missing)])
     err = capsys.readouterr().err
-    assert code == 1
-    assert "cannot read script" in err
+
+    assert code == 2
+    assert "missing" in err and str(missing) in err
     assert "Traceback" not in err
 
 
-def test_empty_script_file_is_a_handled_failure(tmp_path: Path, capsys) -> None:
+def test_empty_script_file_is_a_usage_error(tmp_path: Path, capsys) -> None:
     script = tmp_path / "empty.txt"
     script.write_text("   \n\n", encoding="utf-8")
-    assert main(["story", "--script", str(script)]) == 1
-    assert "is empty" in capsys.readouterr().err
+
+    assert main(["story", "--script", str(script)]) == 2
+    err = capsys.readouterr().err
+    assert "empty" in err and str(script) in err
+
+
+def test_empty_stdin_script_is_a_usage_error(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    """`--script -` with nothing on stdin is the same class of error."""
+    monkeypatch.setattr("sys.stdin", io.StringIO("   \n"))
+
+    assert main(["texts", "--script", "-"]) == 2
+    err = capsys.readouterr().err
+    assert "empty" in err and "stdin" in err
+    assert "Traceback" not in err
+
+
+def test_an_unreadable_script_path_is_a_usage_error(tmp_path: Path, capsys) -> None:
+    """A directory handed to --script names the path rather than crashing."""
+    assert main(["story", "--script", str(tmp_path)]) == 2
+    assert str(tmp_path) in capsys.readouterr().err
 
 
 def test_topic_and_script_are_mutually_exclusive(capsys) -> None:
@@ -1090,3 +1111,44 @@ def test_validate_ignores_the_catalogue_commands() -> None:
 
     for argv in (["voices"], ["styles"], ["assets"], ["doctor"]):
         validate(build_parser().parse_args(argv))
+
+
+def test_doctor_separates_a_whisper_install_from_its_weights(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Importing faster-whisper is not the same as being able to transcribe.
+
+    The weights are downloaded on first use, so an offline box with the package
+    installed still cannot run ASR -- and ``doctor`` has to say so rather than
+    printing a bare OK.
+    """
+    from aiclipper.cli import _transcribe_report
+
+    monkeypatch.setattr("aiclipper.transcribe.available", lambda: True)
+
+    monkeypatch.setattr("aiclipper.cli._whisper_weights_cached", lambda model: True)
+    ok, detail = _transcribe_report(get_settings())
+    assert ok is True and "cached locally" in detail
+
+    monkeypatch.setattr("aiclipper.cli._whisper_weights_cached", lambda model: False)
+    ok, detail = _transcribe_report(get_settings())
+    assert ok is False, detail
+    assert "installed" in detail and "not cached here" in detail
+
+    monkeypatch.setattr("aiclipper.cli._whisper_weights_cached", lambda model: None)
+    ok, detail = _transcribe_report(get_settings())
+    assert ok is True and "not verified" in detail
+
+    monkeypatch.setattr("aiclipper.transcribe.available", lambda: False)
+    ok, detail = _transcribe_report(get_settings())
+    assert ok is False and "aiclipper[transcribe]" in detail
+
+
+def test_the_whisper_weight_probe_never_needs_a_network(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from aiclipper.cli import _whisper_weights_cached
+
+    assert _whisper_weights_cached("") is None
+    # a model given as a local directory needs no cache lookup at all
+    assert _whisper_weights_cached(str(tmp_path)) is True
+    # a name that is not on this disk is reported as missing, not as an error
+    assert _whisper_weights_cached("aiclipper-no-such-model-9f3a") is False

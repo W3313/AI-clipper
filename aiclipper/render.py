@@ -20,7 +20,9 @@ Design rules that the rest of the package relies on:
   :data:`DEFAULT_LOUDNESS_TARGET` sits between ``amix`` and the limiter, so
   every workflow exports at roughly the level short-form platforms normalise
   to instead of the -33..-44 LUFS the raw mix lands at.  Programmes shorter
-  than :data:`LOUDNESS_MIN_DURATION` skip it (the filter misbehaves there).
+  than :data:`LOUDNESS_MIN_DURATION` are looped up to it for the filter and
+  cut back afterwards, so the target holds at every duration instead of
+  stepping at three seconds (see :func:`_loudness_filters`).
   Pass ``loudness_target=None`` -- to :func:`render`/:func:`build_command`, or
   as a ``loudness_target`` attribute on
   :class:`~aiclipper.models.RenderOptions` -- to switch it off and get the
@@ -39,7 +41,9 @@ own audio must therefore not set ``duck`` on its music bed.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -90,7 +94,10 @@ _LOUDNESS_LIMITS = (-70.0, -5.0)
 
 #: Shortest programme ``loudnorm`` is trusted with, in seconds.  See
 #: :func:`_loudnorm`: below this it never establishes its gate and a silent mix
-#: comes out of the chain at full scale.
+#: comes out of the chain at full scale.  It is a floor on what the *filter*
+#: sees, not on what gets normalised -- a shorter programme is looped up to it
+#: by :func:`_loudness_filters` and then cut back down, so there is no
+#: loudness step at this duration.
 LOUDNESS_MIN_DURATION = 3.0
 
 
@@ -136,6 +143,23 @@ def _filter_path(path: str | Path) -> str:
     return text.replace("\\:", "\\\\:").replace("\\'", "\\\\\\'")
 
 
+def _workdir_key(out_path: Path) -> str:
+    """A readable, collision-free directory name for one render's scratch files.
+
+    The stem keeps it recognisable in ``work/render/``; the digest of the
+    absolute output path keeps two renders whose outputs merely share a name
+    (``clips/a/out.mp4`` and ``clips/b/out.mp4``, or two workflows both
+    writing ``out.mp4``) in separate directories even when they run at once.
+    """
+    stem = out_path.stem or "timeline"
+    safe = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in stem)[:48] or "timeline"
+    try:
+        absolute = str(out_path.resolve())
+    except OSError:  # pragma: no cover - resolve() only reads, but stay renderable
+        absolute = str(out_path)
+    return f"{safe}-{hashlib.sha1(absolute.encode('utf-8')).hexdigest()[:10]}"
+
+
 def _color(value: str) -> str:
     """Normalise ``#RRGGBB`` to the ``0xRRGGBB`` form ffmpeg prefers."""
     text = (value or "").strip() or "black"
@@ -157,14 +181,66 @@ def _loudnorm(target: float) -> str:
       *unchanged* rather than being lifted 56 dB into a wall of hiss.
     * Its output never exceeds ``TP``, which we keep below the downstream
       limiter's ceiling, so normalisation cannot introduce clipping.
-    * **It needs three seconds to get there.**  Given less,
-      ``loudnorm,alimiter`` hands back below-gate input at roughly *0 dBFS* --
-      a 2s silent mix measures -91 dB through the limiter alone and -0.0 dB
-      through the pair.  (Each filter on its own is fine; it is the
-      combination, and only under three seconds.)  That is why callers go
-      through :data:`LOUDNESS_MIN_DURATION` instead of calling this blindly.
+    * **It needs three seconds of programme to get there.**  Given less, the
+      gate never engages: ``loudnorm,alimiter`` hands back below-gate input at
+      roughly *0 dBFS* -- a 2s silent mix measures -91 dB through the limiter
+      alone and -0.0 dB through the pair, and a 2s -60 dBFS whisper comes out
+      at -2.2 LUFS.  (Each filter on its own is fine; it is the combination,
+      and only under three seconds.)  Callers therefore go through
+      :func:`_loudness_filters`, which guarantees the filter that much input
+      instead of taking the target away from short programmes.
     """
     return f"loudnorm=I={_fmt(target)}:TP={_fmt(LOUDNESS_TRUE_PEAK)}:LRA={_fmt(LOUDNESS_RANGE)}"
+
+
+def _loudness_filters(duration: float, target: float | None) -> list[str]:
+    """The tail that trims the mix to ``duration`` and normalises it.
+
+    Returned as the filters that sit between ``apad`` and the limiter, so the
+    mix is always cut to length here whether or not normalisation is on.
+
+    At or above :data:`LOUDNESS_MIN_DURATION` that is just the trim plus one
+    ``loudnorm``.  Below it, handing ``loudnorm`` the short programme directly
+    is unsafe (see :func:`_loudnorm`) and *skipping* it is worse: it used to
+    leave everything under three seconds un-normalised, so the same source
+    exported 7.8 dB quieter at 2.9s than at 3.0s -- a cliff no caller can see
+    and two clips out of one batch could straddle.
+
+    Instead the mix is **looped** until ``loudnorm`` has at least
+    :data:`LOUDNESS_MIN_DURATION` of programme ahead of the copy we keep, and
+    only the final copy is kept.  The filter therefore gates on real material
+    (which is what the three-second floor was ever about) while the audio that
+    reaches the output is the programme itself, untouched in content and at
+    its own place on the clock.  Measured on ffmpeg 6.1 across 0.5s..6s in
+    0.5s steps, a quiet narration-over-music mix that used to export at -50
+    LUFS below the threshold now lands between -15.3 and -14.0 LUFS, with no
+    step at 3.0s; digital silence still measures -70 LUFS / -inf peak, a
+    -60 dBFS whisper stays below the gate, and a hot source still comes back
+    on target with peaks under the limiter.
+    """
+    trim = [f"atrim=duration={_fmt(duration)}", "asetpts=PTS-STARTPTS"]
+    if target is None:
+        return trim
+    if duration >= LOUDNESS_MIN_DURATION or duration <= 0:
+        return trim + [_loudnorm(target)]
+
+    # Going in: sample counts, not seconds.  ``aloop`` counts samples, and the
+    # copy it replays has to be the programme to the sample.
+    samples = max(1, int(round(duration * SAMPLE_RATE)))
+    copies = 1 + int(math.ceil(LOUDNESS_MIN_DURATION / duration))
+    # Coming out: seconds.  ``loudnorm`` resamples to 192 kHz internally and
+    # hands that rate on (ffmpeg 6.1), so a sample count here would cut in the
+    # wrong place -- ``start_sample={samples}`` drops a quarter of what it
+    # looks like it drops.  Seconds are rate-agnostic; the trailing
+    # ``aresample``/``aformat`` put the rate back.
+    return [
+        f"atrim=end_sample={samples}",
+        "asetpts=PTS-STARTPTS",
+        f"aloop=loop={copies - 1}:size={samples}",
+        _loudnorm(target),
+        f"atrim=start={_fmt((copies - 1) * duration)}",
+        "asetpts=PTS-STARTPTS",
+    ]
 
 
 def _resolve_loudness(options: RenderOptions, override: float | None | _Unset) -> float | None:
@@ -278,8 +354,16 @@ class _GraphBuilder:
     # -- infrastructure ---------------------------------------------------- #
     @property
     def workdir(self) -> Path:
+        """Where the renderer's own scratch files go.
+
+        Never the output directory: that gets the finished file and nothing
+        else.  The default lives under ``settings.work_dir`` and is keyed by
+        the *absolute* output path, so two renders running at once cannot
+        write each other's ``sendcmd`` scripts while two renders of the same
+        target stay reproducible (hard rule 7).
+        """
         if self._workdir is None:
-            self._workdir = Path(self.settings.work_dir) / f"render-{self.out_path.stem or 'timeline'}"
+            self._workdir = Path(self.settings.work_dir) / "render" / _workdir_key(self.out_path)
         self._workdir.mkdir(parents=True, exist_ok=True)
         return self._workdir
 
@@ -516,19 +600,15 @@ class _GraphBuilder:
                 mix[i] = out
 
         inputs = "".join(f"[{mix[i]}]" for i in range(len(labels)))
-        tail = [
-            "apad",
-            f"atrim=duration={_fmt(self.duration)}",
-            "asetpts=PTS-STARTPTS",
-        ]
         # Normalise the finished mix, then limit: loudnorm sits *between* the
         # mix and the limiter so the limiter is still the last thing to touch
         # the samples and remains the clipping backstop.  Programmes too short
-        # for loudnorm to establish its gate are left alone -- see
-        # :func:`_loudnorm` -- which is also the floor that keeps a silent
-        # timeline silent.
-        if self.loudness_target is not None and self.duration >= LOUDNESS_MIN_DURATION:
-            tail.append(_loudnorm(self.loudness_target))
+        # for loudnorm to establish its gate are looped up to
+        # :data:`LOUDNESS_MIN_DURATION` for the filter and cut back afterwards
+        # -- see :func:`_loudness_filters` -- so every duration gets the same
+        # treatment and silence still comes out silent.
+        tail = ["apad"]
+        tail += _loudness_filters(self.duration, self.loudness_target)
         tail += [
             _LIMITER,
             "aresample=async=1",
@@ -660,9 +740,11 @@ def build_command(
     Raises :class:`~aiclipper.errors.RenderError` when the timeline does not
     validate, when a referenced file is missing, or when an animated crop path
     changes size between keyframes.  Any ``sendcmd`` scripts needed by animated
-    crops are written into ``workdir`` (defaults to a directory under
-    ``settings.work_dir``) as a side effect -- including under ``dry_run``,
-    since the returned command is only runnable if those scripts exist.
+    crops are written into ``workdir`` as a side effect -- including under
+    ``dry_run``, since the returned command is only runnable if those scripts
+    exist.  ``workdir`` defaults to ``settings.work_dir/render/<stem>-<hash of
+    the absolute output path>``; nothing the renderer generates for its own use
+    is ever written to the output directory.
 
     No media is decoded here: sources are checked for existence, never probed,
     so a command can be built for files ffmpeg has not seen yet.
@@ -708,13 +790,15 @@ def render(
     settings = settings or get_settings()
     options = options or RenderOptions()
     out = Path(out_path)
-    workdir = out.parent / f".{out.stem or 'timeline'}-render"
+    # No ``workdir=``: the renderer's scratch files belong under
+    # ``settings.work_dir`` (see :meth:`_GraphBuilder.workdir`), not next to
+    # the finished video.  ``out.parent`` is the user's output directory and
+    # only ever receives ``out`` itself.
     cmd = build_command(
         timeline,
         out,
         options=options,
         settings=settings,
-        workdir=workdir,
         loudness_target=loudness_target,
     )
 

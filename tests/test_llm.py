@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -299,8 +300,10 @@ def test_heuristic_chat_output_is_usable(heuristic: HeuristicProvider) -> None:
 def test_heuristic_forum_output_is_usable(heuristic: HeuristicProvider) -> None:
     data = heuristic.complete_json(REAL_PROMPTS["forum"], prompts.FORUM_SCHEMA)
     post = RedditPost(**data)
-    assert post.community.startswith("r/") and len(post.community) > 3
-    assert post.author.startswith("u/") and len(post.author) > 3
+    # Plain names only -- the offline provider must not emit another service's
+    # handle grammar, because the story card is our own design (hard rule 6).
+    assert len(post.community) > 3 and not re.match(r"^/?[ru]/", post.community)
+    assert len(post.author) > 3 and not re.match(r"^/?[ru]/", post.author)
     assert post.upvotes > 0 and post.comments > 0
     assert len(post.narration.split()) > 10
 
@@ -891,7 +894,7 @@ def test_unsatisfiable_multiple_of_stays_inside_the_range(heuristic: HeuristicPr
 
 PATTERNS = [
     r"^#[a-z0-9]+$",
-    r"^r/[a-z]{3,20}$",
+    r"^ch-[a-z]{3,20}$",
     r"^\d{4}-\d{2}-\d{2}$",
     r"^[A-Z]{2}-\d{3,5}$",
     r"^(alpha|beta|gamma)$",

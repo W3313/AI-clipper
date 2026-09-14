@@ -851,3 +851,80 @@ def test_output_naming(env, tmp_path: Path):
     assert first.output != second.output
     assert first.output.exists() and second.output.exists()
     assert second.output.name.endswith("-2.mp4")
+
+
+def test_the_default_filename_comes_from_the_topic(env):
+    """``--topic "a lost cat"`` must not land on a file named after an invention."""
+    result = run(topic="a lost cat", turns=4)
+
+    assert result.output.stem == "a-lost-cat", result.output.name
+    # The generated headline is still what a human sees, in both places.
+    assert result.title
+    assert result.title.lower() != "a lost cat"
+    assert result.metadata["script"]["title"] == result.title
+    assert result.metadata["topic"] == "a lost cat"
+
+
+def test_a_supplied_conversation_still_names_its_file_from_the_title(env):
+    """With no topic there is nothing but the title to name the file after."""
+    result = run(script=PARSED_SCRIPT)
+
+    assert result.output.stem == "locked-out", result.output.name
+    assert result.title == "Locked Out"
+
+
+# --------------------------------------------------------------------------- #
+# speech backend fallback
+# --------------------------------------------------------------------------- #
+
+def test_a_backend_that_dies_mid_conversation_falls_back_to_offline(env, monkeypatch, caplog):
+    """edge-tts with no network must not take the render down with it.
+
+    The conversation is re-spoken from the first message by the next backend, so
+    the finished video never mixes two voices on one side.
+    """
+    from aiclipper.errors import TTSError
+
+    class HalfDeadTTS:
+        name = "halfdead"
+        calls = 0
+
+        def available(self) -> bool:
+            return True
+
+        def synthesize(self, text, out_path, *, voice):  # noqa: ANN001
+            HalfDeadTTS.calls += 1
+            if HalfDeadTTS.calls > 1:
+                raise TTSError("synthesis failed: the network went away")
+            return texts.tts.OfflineTTS().synthesize(text, out_path, voice=voice)
+
+    monkeypatch.setattr(texts.tts, "get_provider", lambda **kw: HalfDeadTTS())
+
+    with caplog.at_level("WARNING"):
+        result = run(script=PARSED_SCRIPT)
+
+    assert result.output.exists()
+    assert result.metadata["tts_provider"] == "offline", "the backend that really spoke is reported"
+    assert HalfDeadTTS.calls > 1, "the dead backend was actually tried"
+    assert any("halfdead" in record.getMessage() for record in caplog.records), caplog.text
+    assert _probe(result).has_audio
+
+
+def test_no_backend_left_means_the_original_failure_propagates(env, monkeypatch):
+    """With nothing behind it, a failing backend still raises its own error."""
+    from aiclipper.errors import TTSError
+
+    class DeadTTS:
+        name = "dead"
+
+        def available(self) -> bool:
+            return True
+
+        def synthesize(self, text, out_path, *, voice):  # noqa: ANN001
+            raise TTSError("synthesis failed: the network went away")
+
+    monkeypatch.setattr(texts.tts, "get_provider", lambda **kw: DeadTTS())
+    monkeypatch.setattr(texts.tts, "fallback_chain", lambda provider, **kw: [provider])
+
+    with pytest.raises(TTSError, match="the network went away"):
+        run(script=PARSED_SCRIPT)

@@ -370,9 +370,11 @@ readers -- not on a shrug.
 * Invent everybody. Changed names are fine; real people, real companies and \
 real places with a grievance attached are not. Keep it safe for a general \
 audience: awkward and dramatic, not graphic or hateful.
-* `community` is an invented forum name in the form `r/<something>`; `author` \
-is an invented handle in the form `u/<something>`. `upvotes` and `comments` are \
-plausible engagement counts for a popular post, not records.
+* `community` is an invented forum name written as plain readable words, and \
+`author` is an invented display name for the poster. Neither carries a site \
+prefix: no `r/`, no `u/`, no `@`, no leading slash -- this card is our own \
+design and labels those fields itself. `upvotes` and `comments` are plausible \
+engagement counts for a popular post, not records.
 """
 
 FORUM_SCHEMA: dict[str, Any] = {
@@ -384,13 +386,13 @@ FORUM_SCHEMA: dict[str, Any] = {
             "type": "string",
             "minLength": 2,
             "maxLength": 40,
-            "description": "Invented forum name, e.g. 'r/storiesfromwork'.",
+            "description": "Invented forum name in plain words, no site prefix, e.g. 'Stories From Work'.",
         },
         "author": {
             "type": "string",
             "minLength": 2,
             "maxLength": 40,
-            "description": "Invented author handle, e.g. 'u/quietdeskplant'.",
+            "description": "Invented poster name, no site prefix, e.g. 'quiet desk plant'.",
         },
         "title": {
             "type": "string",

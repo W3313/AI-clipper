@@ -641,3 +641,131 @@ def test_audio_and_caption_clocks_agree_at_the_boundary(make_video, fake_asr, tm
     assert max(end for _s, end in spans) <= clip_duration + 1e-6
     # The final cue reaches the end of the clip: no dead tail, no overrun.
     assert max(end for _s, end in spans) >= clip_duration - 0.35
+
+
+# --------------------------------------------------------------------------- #
+# whole-word snapping must never under-deliver min_duration
+# --------------------------------------------------------------------------- #
+
+def _grid(spans: list[tuple[float, float]], duration: float) -> Transcript:
+    """A transcript whose words sit exactly on ``spans``."""
+    tokens = "here is the part nobody tells you about shipping something people want".split()
+    words = [
+        Word(tokens[index % len(tokens)], round(start, 3), round(end, 3))
+        for index, (start, end) in enumerate(spans)
+    ]
+    transcript = Transcript.from_words(words, language="en")
+    transcript.duration = duration
+    return transcript
+
+
+def _run_of(spans: list[tuple[float, float]], *, step: float, first: float, last: float):
+    """``first`` .. ``last`` filled with ``step``-long words, appended to ``spans``."""
+    cursor = first
+    while cursor + step <= last + 1e-9:
+        spans.append((cursor, cursor + step))
+        cursor += step
+    return spans
+
+
+def _long_tail() -> Transcript:
+    """Short words, then one long trailing word straddling the requested end."""
+    spans = _run_of([], step=0.4, first=0.0, last=14.0)
+    spans.append((14.0, 16.5))
+    return _grid(spans, 20.0)
+
+
+def _long_head() -> Transcript:
+    """One long opening word straddling the requested start."""
+    spans: list[tuple[float, float]] = [(2.0, 6.5)]
+    _run_of(spans, step=0.4, first=6.5, last=24.0)
+    return _grid(spans, 25.0)
+
+
+def _long_both_edges() -> Transcript:
+    """A long word at each edge of the requested window."""
+    spans: list[tuple[float, float]] = [(1.0, 5.4)]
+    _run_of(spans, step=0.4, first=5.4, last=18.0)
+    spans.append((18.0, 20.4))
+    return _grid(spans, 24.0)
+
+
+@pytest.mark.parametrize(
+    ("build", "seconds", "window", "low", "high"),
+    [
+        (_long_tail, 20.0, (0.0, 15.0), 15.0, 20.0),
+        (_long_head, 25.0, (5.0, 20.0), 15.0, 20.0),
+        (_long_both_edges, 24.0, (5.0, 20.0), 15.0, 22.0),
+    ],
+)
+def test_whole_word_snapping_never_returns_less_than_min_duration(
+    make_video, fake_asr, stub_render, monkeypatch, build, seconds, window, low, high
+):
+    """Honouring whole words must not hand back a third of the requested length."""
+    from aiclipper import highlight as highlight_module
+    from aiclipper.models import ClipCandidate
+
+    transcript = build()
+    source = make_video("talk.mp4", seconds=seconds, width=320, height=240, fps=12)
+    fake_asr(transcript)
+    monkeypatch.setattr(
+        highlight_module,
+        "select",
+        lambda *a, **k: [
+            ClipCandidate(start=window[0], end=window[1], title="Moment", hook="", reason="stub",
+                          score=1.0, tags=[])
+        ],
+    )
+
+    results = clip.run(source, count=1, min_duration=low, max_duration=high, reframe=False)
+
+    assert results, "a window that cannot honour the minimum must not silently shrink"
+    for result in results:
+        start, end = result.metadata["window"]
+        assert end - start >= low - 1e-6, f"{end - start:.3f}s delivered for a {low:.1f}s request"
+        assert end - start <= high + 1e-6
+        assert end <= seconds + 1e-6
+        straddling = [w for w in transcript.words if w.start < start - 1e-6 < w.end]
+        straddling += [w for w in transcript.words if w.start < end - 1e-6 < w.end - 1e-6]
+        assert straddling == [], f"window {start}-{end} cuts {straddling}"
+
+
+def test_a_window_that_cannot_meet_the_minimum_is_dropped(
+    make_video, fake_asr, stub_render, monkeypatch
+):
+    """Better no clip at all than a 2s clip billed as a 15s one."""
+    from aiclipper import highlight as highlight_module
+    from aiclipper.models import ClipCandidate
+
+    # Two words: a short one, then one that runs to the end of the media.  No
+    # whole-word window of >= 15s fits inside a 16s ceiling.
+    transcript = _grid([(0.0, 2.0), (2.0, 20.0)], 20.0)
+    source = make_video("talk.mp4", seconds=20.0, width=320, height=240, fps=12)
+    fake_asr(transcript)
+    monkeypatch.setattr(
+        highlight_module,
+        "select",
+        lambda *a, **k: [
+            ClipCandidate(start=0.0, end=15.0, title="Moment", hook="", reason="stub",
+                          score=1.0, tags=[])
+        ],
+    )
+
+    results = clip.run(source, count=1, min_duration=15.0, max_duration=16.0, reframe=False)
+
+    assert results == []
+    assert stub_render == []
+
+
+def test_a_source_shorter_than_the_minimum_still_yields_a_clip(make_video, fake_asr, stub_render):
+    """The floor defends the caller's minimum; it does not veto a short source."""
+    source = make_video("talk.mp4", seconds=6.0, width=320, height=240, fps=12)
+    transcript = _offset_speech(6.4)
+    fake_asr(transcript)
+
+    results = clip.run(source, count=1, min_duration=15.0, max_duration=60.0, reframe=False)
+
+    assert len(results) == 1
+    start, end = results[0].metadata["window"]
+    assert end <= 6.0 + 1e-6
+    assert any(w.end == pytest.approx(end) for w in transcript.words)

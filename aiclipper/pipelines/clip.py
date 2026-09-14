@@ -150,8 +150,16 @@ def _clamped(candidates: list[ClipCandidate], limit: float) -> list[ClipCandidat
     return out
 
 
-def _whole_word_window(words: Sequence[Word], start: float, end: float) -> tuple[float, float]:
-    """Pull ``[start, end)`` back onto whole-word edges, never outwards.
+def _whole_word_window(
+    words: Sequence[Word],
+    start: float,
+    end: float,
+    *,
+    min_duration: float = 0.0,
+    max_duration: float = float("inf"),
+    limit: float | None = None,
+) -> tuple[float, float] | None:
+    """Pull ``[start, end)`` onto whole-word edges, growing before it shrinks.
 
     :func:`aiclipper.highlight.select` already snaps to word edges, but a window
     does not necessarily survive the trip: clamping it to the probed media
@@ -160,33 +168,108 @@ def _whole_word_window(words: Sequence[Word], start: float, end: float) -> tuple
     :meth:`~aiclipper.models.Transcript.slice` would hand the caption builder a
     word truncated to the boundary, and the render would cut it mid-read.
 
-    So both edges move *inwards* to the nearest whole word: a word straddling
-    the head is dropped (the clip starts after it), and the tail ends on the
-    last word that fits entirely.  Shrinking rather than growing keeps the
-    window inside the media, inside ``max_duration`` and clear of its
-    neighbours; the price is at most one part-heard word per edge.  A window
-    holding no whole word at all is left exactly as it was -- a truncated word
-    still beats no clip.
+    So an edge that cuts a word moves to that word's own boundary -- **outward**
+    by preference, so the clip grows to take the whole word in rather than
+    giving it up.  Shrinking (starting after the straddling word, or ending on
+    the last word that fits entirely) is the fallback, taken only when growing
+    would push past ``max_duration`` or past ``limit`` -- the probed media
+    duration.  Of the arrangements that fit, the longest wins.
+
+    ``min_duration`` is a floor the snap may not break: honouring whole words is
+    never worth handing back a fraction of the clip the caller asked for.  When
+    no arrangement clears it, ``None`` comes back and the caller drops the
+    candidate -- one clip fewer is an outcome a caller can see, a clip a third
+    of the requested length is not.
+
+    Two cases have no minimum left to defend and keep their old behaviour: a
+    window that arrived shorter than ``min_duration`` already (the source cannot
+    host one), where whole words win at whatever length they leave; and a window
+    holding no whole word at all, which is returned exactly as it was because a
+    truncated word still beats no clip.
     """
     inside = [w for w in words if w.end > start + _EPSILON and w.start < end - _EPSILON]
+    if not inside:
+        return start, end
+    head_cut = inside[0].start < start - _EPSILON
+    tail_cut = inside[-1].end > end + _EPSILON
+    if not head_cut and not tail_cut:
+        return start, end
+
     whole = [w for w in inside if w.start >= start - _EPSILON and w.end <= end + _EPSILON]
-    if not inside or not whole:
-        return start, end
-    new_start = start if inside[0] is whole[0] else whole[0].start
-    new_end = end if inside[-1] is whole[-1] else whole[-1].end
-    if new_end - new_start <= MIN_RENDERABLE:
-        return start, end
-    return round(max(0.0, new_start), 6), round(new_end, 6)
+    span = end - start
+    ceiling = max(float(max_duration), span)
+    top = float(limit) if limit is not None and limit > 0 else None
+
+    # Outward first, inward second; of the arrangements that fit, the longest wins.
+    starts = [max(0.0, inside[0].start), whole[0].start if whole else inside[0].end] if head_cut \
+        else [start]
+    ends = [inside[-1].end, whole[-1].end if whole else inside[-1].start] if tail_cut else [end]
+
+    def _longest(floor: float) -> tuple[float, float] | None:
+        best: tuple[float, float] | None = None
+        for new_start in starts:
+            for new_end in ends:
+                width = new_end - new_start
+                if new_start < -_EPSILON or width <= MIN_RENDERABLE:
+                    continue
+                if top is not None and new_end > top + _EPSILON:
+                    continue
+                if width < floor - _EPSILON or width > ceiling + _EPSILON:
+                    continue
+                if best is None or width > (best[1] - best[0]) + _EPSILON:
+                    best = (new_start, new_end)
+        return best
+
+    wanted = max(MIN_RENDERABLE, min(float(min_duration), span))
+    best = _longest(wanted)
+    if best is None and span < float(min_duration) - _EPSILON:
+        # The window arrived shorter than the caller's minimum already -- the
+        # source cannot host one -- so there is no minimum left to defend and
+        # whole words win, exactly as they did before.
+        best = _longest(MIN_RENDERABLE)
+    if best is None:
+        return (start, end) if not whole else None
+    return round(max(0.0, best[0]), 6), round(best[1], 6)
 
 
-def _snapped(candidates: list[ClipCandidate], transcript: Transcript) -> list[ClipCandidate]:
-    """Apply :func:`_whole_word_window` to every candidate, in place of nothing."""
+def _snapped(
+    candidates: list[ClipCandidate],
+    transcript: Transcript,
+    *,
+    min_duration: float = 0.0,
+    max_duration: float = float("inf"),
+    limit: float | None = None,
+) -> list[ClipCandidate]:
+    """Apply :func:`_whole_word_window` to every candidate, dropping the impossible.
+
+    A candidate whose whole-word edges cannot be reconciled with
+    ``min_duration``, ``max_duration`` and the media length is left out of the
+    result: fewer clips is an outcome a caller can see and act on, a clip a
+    third of the requested length is not.
+    """
     words = transcript.words
     if not words:
         return candidates
     out: list[ClipCandidate] = []
     for candidate in candidates:
-        start, end = _whole_word_window(words, float(candidate.start), float(candidate.end))
+        window = _whole_word_window(
+            words,
+            float(candidate.start),
+            float(candidate.end),
+            min_duration=min_duration,
+            max_duration=max_duration,
+            limit=limit,
+        )
+        if window is None:
+            log.info(
+                "dropped clip window %.3f-%.3f: no whole-word window of %.2f-%.2fs fits there",
+                candidate.start,
+                candidate.end,
+                min_duration,
+                max_duration,
+            )
+            continue
+        start, end = window
         if (start, end) != (candidate.start, candidate.end):
             log.debug(
                 "snapped clip window %.3f-%.3f to whole words %.3f-%.3f",
@@ -244,6 +327,9 @@ def _select(
                 media.duration,
             ),
             transcript,
+            min_duration=min_duration,
+            max_duration=max_duration,
+            limit=media.duration,
         )
     if picked:
         return picked, "highlight"
@@ -252,7 +338,14 @@ def _select(
     windows = even_windows(
         media.duration, count=count, min_duration=min_duration, max_duration=max_duration
     )
-    return _snapped(_clamped(windows, media.duration), transcript), "even"
+    snapped = _snapped(
+        _clamped(windows, media.duration),
+        transcript,
+        min_duration=min_duration,
+        max_duration=max_duration,
+        limit=media.duration,
+    )
+    return snapped, "even"
 
 
 # --------------------------------------------------------------------------- #

@@ -147,21 +147,30 @@ def _configure_logging(verbosity: int) -> None:
 # --------------------------------------------------------------------------- #
 
 def read_script(value: str | None) -> str | None:
-    """Resolve a ``--script`` argument: ``None``, ``-`` (stdin) or a file path."""
+    """Resolve a ``--script`` argument: ``None``, ``-`` (stdin) or a file path.
+
+    A script that cannot be read is bad *input*, not a failed render, so every
+    way of getting it wrong raises :class:`UsageError` -- exit 2, the same as an
+    unknown caption preset or a missing ``--topic`` -- and the message names the
+    path and says whether it was missing, unreadable or empty.
+    """
     if value is None:
         return None
     if value == "-":
         text = sys.stdin.read()
-        where = "stdin"
-    else:
-        path = Path(value).expanduser()
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise RuntimeError(f"cannot read script {path}: {exc.strerror or exc}") from exc
-        where = str(path)
+        if not text.strip():
+            raise UsageError("--script -: the script read from stdin is empty")
+        return text
+
+    path = Path(value).expanduser()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise UsageError(f"--script {path}: the script file is missing") from exc
+    except OSError as exc:
+        raise UsageError(f"--script {path}: cannot read the script file ({exc.strerror or exc})") from exc
     if not text.strip():
-        raise RuntimeError(f"the script read from {where} is empty")
+        raise UsageError(f"--script {path}: the script file is empty")
     return text
 
 
@@ -667,7 +676,7 @@ def _cmd_doctor(ns: argparse.Namespace) -> int:
     rows.append(_check("llm provider", lambda: _llm_report(settings)))
     for name in _TTS_BACKENDS:
         rows.append(_check(f"tts:{name}", lambda name=name: _tts_report(name, settings)))
-    rows.append(_check("transcribe", lambda: _transcribe_report()))
+    rows.append(_check("transcribe", lambda: _transcribe_report(settings)))
     rows.append(_check("chromium", lambda: _chromium_report(settings)))
     rows.append(_check("assets", lambda: _library_report(settings)))
 
@@ -707,12 +716,49 @@ def _llm_report(settings: Settings) -> tuple[bool, str]:
     return bool(provider.available()), f"{settings.llm_provider!r} resolves to {provider.name}"
 
 
-def _transcribe_report() -> tuple[bool, str]:
+def _transcribe_report(settings: Settings) -> tuple[bool, str]:
+    """Installed *and* able to run: the weights have to be on this disk too.
+
+    ``faster-whisper`` importing proves nothing on its own -- the first real
+    transcription downloads a model, which is exactly what an offline box cannot
+    do.  So this row follows the same installed-vs-usable rule the ``tts:`` rows
+    follow, and says which of the two is missing.
+    """
     from . import transcribe
 
     if not transcribe.available():
         return False, "pip install 'aiclipper[transcribe]' (no ASR: clip falls back to even windows)"
-    return True, "faster-whisper is importable"
+    name = settings.whisper_model
+    cached = _whisper_weights_cached(name)
+    if cached is False:
+        return False, (
+            f"faster-whisper installed, but model {name!r} is not cached here; the first run "
+            "downloads it (without ASR, clip falls back to even windows)"
+        )
+    if cached is None:
+        return True, f"faster-whisper is importable (model {name!r} not verified)"
+    return True, f"faster-whisper, model {name!r} cached locally"
+
+
+def _whisper_weights_cached(model: str) -> bool | None:
+    """Are ``model``'s weights already on disk?  ``None`` when we cannot tell.
+
+    Never touches the network: a local directory is checked directly, and the
+    Hugging Face cache is queried with ``local_files_only=True``.
+    """
+    if not model:
+        return None
+    if Path(model).expanduser().is_dir():
+        return True
+    try:
+        from faster_whisper.utils import download_model
+    except Exception:  # noqa: BLE001 - an internal helper we are allowed to lose
+        return None
+    try:
+        download_model(model, local_files_only=True)
+    except Exception:  # noqa: BLE001 - any failure here means "not cached"
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------- #

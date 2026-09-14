@@ -32,6 +32,13 @@ capability: `transcribe` (speech recognition), `ingest` (URL downloads), `vision
 (face-tracked reframing), `llm` (Claude-written scripts), `tts` (neural voices),
 `overlays` (browser-rendered chat graphics).
 
+Two extras need one more step before they can do anything. `overlays` installs
+the Playwright driver but not a browser -- run `playwright install chromium` for
+that, or let the chat and forum graphics fall back to the built-in Pillow
+renderer, which draws the same design. `transcribe` downloads its Whisper
+weights the first time you clip something, so that first run needs network.
+`aiclip doctor` tells you which of the two is missing.
+
 Check what you have:
 
 ```bash
@@ -58,8 +65,9 @@ aiclip voices --tag calm
 aiclip styles
 ```
 
-Output lands in `out/` unless you pass `--out`. Every command prints the paths it
-wrote, one per line, so it composes in a shell pipeline.
+Output lands in `out/` unless you pass `--out`. Every command that renders prints
+the paths it wrote to stdout, one per line, and nothing else -- progress and
+warnings go to stderr -- so it composes in a shell pipeline.
 
 ## Use it as a library
 
@@ -77,8 +85,14 @@ metadata about how it was made. The `clip` pipeline returns one per short.
 
 There is a complete offline path: a rule-based script writer, a speech synthesiser
 that produces correctly timed silence, and procedurally generated backgrounds and
-music. Every workflow runs, and the whole test suite passes, with no API keys, no
-network and no downloaded assets.
+music. All five workflows run, and the whole test suite passes, with no API keys,
+no network and no downloaded assets.
+
+What degrades rather than fails: the scripts are templated instead of written,
+the narration is silence of the right length instead of a voice, and `clip` -- if
+the Whisper weights have never been downloaded -- cuts evenly spaced windows with
+no captions instead of ranked, captioned moments. Nothing raises, and every
+fallback says so on stderr.
 
 Quality improves a lot with real providers, and nothing is blocked without them:
 
@@ -112,10 +126,15 @@ interface; [docs/PIPELINES.md](docs/PIPELINES.md) covers the workflows and CLI.
 ## Configuration
 
 Every setting is an environment variable, so the same code runs on a laptop, in
-CI and in a container: `AICLIP_WIDTH`, `AICLIP_HEIGHT`, `AICLIP_FPS`,
-`AICLIP_WORK_DIR`, `AICLIP_OUTPUT_DIR`, `AICLIP_ASSETS_DIR`, `AICLIP_OFFLINE`,
-`AICLIP_SEED`, `AICLIP_LLM_MODEL`, `AICLIP_VOICE`, `AICLIP_WHISPER_MODEL`. The
-global CLI flags set them for you.
+CI and in a container. The ones worth knowing: `AICLIP_WIDTH`, `AICLIP_HEIGHT`,
+`AICLIP_FPS`, `AICLIP_WORK_DIR`, `AICLIP_OUTPUT_DIR`, `AICLIP_ASSETS_DIR`,
+`AICLIP_OFFLINE`, `AICLIP_SEED`, `AICLIP_LLM_MODEL`, `AICLIP_VOICE`,
+`AICLIP_WHISPER_MODEL`. The global CLI flags set them for you.
+`aiclipper/config.py` is the full list -- provider and binary overrides
+(`AICLIP_LLM`, `AICLIP_TTS`, `AICLIP_FFMPEG`, `AICLIP_CHROMIUM`) live there too.
+
+Scratch files go to `AICLIP_WORK_DIR`; `AICLIP_OUTPUT_DIR` only ever receives
+finished videos.
 
 Runs are deterministic under a fixed `--seed`.
 

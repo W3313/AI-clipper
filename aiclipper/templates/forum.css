@@ -71,11 +71,15 @@ body {
   line-height: var(--meta-line);
 }
 
-#author {
+#byline {
   color: var(--meta-fg);
-  font-size: var(--fs);
-  line-height: var(--meta-line);
+  font-size: var(--author-fs);
+  line-height: var(--author-line);
   margin-top: var(--author-gap);
+}
+
+#byline.empty {
+  display: none;
 }
 
 #title {
@@ -107,8 +111,11 @@ body {
   display: none;
 }
 
+/* a hairline keeps the counts quiet and separate from the story above */
 #row {
   margin-top: var(--gap-row);
+  padding-top: var(--rule-gap);
+  border-top: var(--edge-w) solid var(--rule);
   display: flex;
   gap: var(--chip-gap);
 }
@@ -116,7 +123,7 @@ body {
 .chip {
   display: flex;
   align-items: center;
-  gap: calc(var(--icon) * 0.96);
+  gap: var(--mark-gap);
   padding: 0 var(--chip-pad);
   height: var(--chip-h);
   border-radius: 999px;
@@ -126,31 +133,38 @@ body {
   font-size: var(--fs);
 }
 
-.arrow {
-  flex: 0 0 auto;
-  width: 0;
-  height: 0;
-  border-left: var(--icon) solid transparent;
-  border-right: var(--icon) solid transparent;
-  border-bottom: calc(var(--icon) * 1.5) solid var(--accent);
-}
-
-.speech {
+/* Engagement marks -- our own abstract geometry, not any real service's icon.
+ * The fractions below are _SCORE_BARS / _REPLY_BARS in aiclipper.overlays,
+ * which is what the Pillow backend draws with. */
+.mark {
   position: relative;
   flex: 0 0 auto;
-  width: calc(var(--icon) * 2);
-  height: calc(var(--icon) * 1.7);
-  border-radius: calc(var(--icon) * 0.45);
+  width: var(--mark-w);
+  height: var(--mark-h);
+}
+
+.mark i {
+  position: absolute;
+  border-radius: 999px;
+}
+
+/* score: three rising bars */
+.score i {
+  bottom: 0;
+  width: calc(var(--mark-w) * 0.24);
+  background: var(--accent);
+}
+
+.score i:nth-child(1) { left: 0; height: calc(var(--mark-h) * 0.40); }
+.score i:nth-child(2) { left: calc(var(--mark-w) * 0.38); height: calc(var(--mark-h) * 0.68); }
+.score i:nth-child(3) { left: calc(var(--mark-w) * 0.76); height: var(--mark-h); }
+
+/* replies: two stacked bars */
+.replies i {
+  left: 0;
+  height: calc(var(--mark-h) * 0.24);
   background: var(--chip-fg);
 }
 
-.speech::after {
-  content: "";
-  position: absolute;
-  left: calc(var(--icon) * 0.45);
-  top: calc(var(--icon) * 1.6);
-  width: 0;
-  height: 0;
-  border-left: calc(var(--icon) * 0.6) solid var(--chip-fg);
-  border-bottom: calc(var(--icon) * 0.75) solid transparent;
-}
+.replies i:nth-child(1) { top: calc(var(--mark-h) * 0.16); width: var(--mark-w); }
+.replies i:nth-child(2) { top: calc(var(--mark-h) * 0.60); width: calc(var(--mark-w) * 0.55); }

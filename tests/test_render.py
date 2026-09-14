@@ -560,19 +560,64 @@ def test_a_silent_timeline_is_not_loudness_normalised(tmp_path: Path, vid: Path)
     assert "anullsrc" in graph and "loudnorm" not in graph
 
 
-def test_a_programme_too_short_for_loudnorm_skips_it(tmp_path: Path, vid: Path, snd: Path):
-    """Under three seconds ``loudnorm,alimiter`` returns below-gate audio at
-    full scale (ffmpeg 6.1), so the graph must not reach for it."""
+def short_tail(tmp_path: Path, vid: Path, snd: Path, duration: float) -> str:
+    tl = Timeline(width=320, height=568, fps=30, duration=duration)
+    tl.add_visual(VisualLayer(kind="video", src=str(vid)))
+    tl.add_audio(AudioTrack(src=str(snd), role="voice"))
+    return chain_with(build_command(tl, tmp_path / "out.mp4"), "amix=")
+
+
+def test_every_duration_is_loudness_normalised_there_is_no_three_second_cliff(
+    tmp_path: Path, vid: Path, snd: Path
+):
+    """The defect: ``loudnorm`` used to be skipped below three seconds, so the
+    same source exported ~8 dB quieter at 2.9s than at 3.0s."""
     from aiclipper.render import LOUDNESS_MIN_DURATION
 
     assert LOUDNESS_MIN_DURATION == 3.0
-    for duration, normalised in ((2.5, False), (2.999, False), (3.0, True), (6.0, True)):
-        tl = Timeline(width=320, height=568, fps=30, duration=duration)
-        tl.add_visual(VisualLayer(kind="video", src=str(vid)))
-        tl.add_audio(AudioTrack(src=str(snd), role="voice"))
-        graph = graph_of(build_command(tl, tmp_path / "out.mp4"))
-        assert ("loudnorm" in graph) is normalised, duration
-        assert "alimiter" in graph          # the limiter is never skipped
+    for duration in (0.5, 1.0, 2.0, 2.5, 2.999, 3.0, 4.5, 6.0):
+        chain = short_tail(tmp_path, vid, snd, duration)
+        assert "loudnorm=I=-14:TP=-1.5:LRA=11" in chain, duration
+        assert "alimiter" in chain          # the limiter is never skipped
+
+
+def test_a_programme_shorter_than_the_floor_is_looped_up_to_it_then_cut_back(
+    tmp_path: Path, vid: Path, snd: Path
+):
+    """loudnorm needs three seconds of programme to gate on -- so it is *given*
+    three seconds of the programme, and only the last copy reaches the output."""
+    chain = short_tail(tmp_path, vid, snd, 2.0)
+    samples = 2 * 48000
+    copies = 1 + 2                          # ceil(3.0 / 2.0) extra copies
+    assert f"atrim=end_sample={samples}" in chain           # exact-length programme
+    assert f"aloop=loop={copies - 1}:size={samples}" in chain
+    assert chain.index("aloop=") < chain.index("loudnorm=")
+    # the kept copy is the final one, and the cut is still ahead of the limiter.
+    # It is expressed in seconds because loudnorm hands on 192 kHz, not 48 kHz.
+    assert f"atrim=start={(copies - 1) * 2}" in chain
+    assert "start_sample" not in chain.split("loudnorm=")[1]
+    assert chain.index("loudnorm=") < chain.index("atrim=start=") < chain.index("alimiter")
+
+    # ...and a programme at or above the floor keeps the plain, unlooped tail
+    long_chain = short_tail(tmp_path, vid, snd, 3.0)
+    assert "aloop=" not in long_chain and "_sample=" not in long_chain
+    assert "apad,atrim=duration=3,asetpts=PTS-STARTPTS,loudnorm=" in long_chain
+
+
+def test_a_short_programme_with_normalisation_off_keeps_the_plain_tail(
+    tmp_path: Path, vid: Path, snd: Path
+):
+    """The loop only exists to feed ``loudnorm``: with no target there is none."""
+    tl = Timeline(width=320, height=568, fps=30, duration=2.0)
+    tl.add_visual(VisualLayer(kind="video", src=str(vid)))
+    tl.add_audio(AudioTrack(src=str(snd), role="voice"))
+    chain = chain_with(build_command(tl, tmp_path / "out.mp4", loudness_target=None), "amix=")
+    assert "aloop=" not in chain and "_sample=" not in chain
+    assert chain.endswith(
+        "apad,atrim=duration=2,asetpts=PTS-STARTPTS,alimiter=limit=0.95:level=0,"
+        "aresample=async=1,aformat=sample_fmts=fltp:sample_rates=48000:"
+        "channel_layouts=stereo[aout]"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -936,14 +981,53 @@ def test_dry_run_still_writes_the_sendcmd_script(tmp_path: Path, vid: Path):
     assert not out.exists()
 
 
-def test_animated_crop_defaults_to_the_settings_work_dir(tmp_path: Path, vid: Path, settings):
+def animated(vid: Path) -> Timeline:
     path = CropPath(
         [CropKeyframe(0.0, 0, 0, 100, 80), CropKeyframe(1.0, 60, 0, 100, 80)], 200, 160
     )
     tl = Timeline(width=320, height=568, fps=30, duration=4.0)
     tl.add_visual(VisualLayer(kind="video", src=str(vid), crop=path))
-    build_command(tl, tmp_path / "out.mp4")
-    assert list((settings.work_dir / "render-out").glob("*.cmd"))
+    return tl
+
+
+def test_animated_crop_defaults_to_the_settings_work_dir(tmp_path: Path, vid: Path, settings):
+    build_command(animated(vid), tmp_path / "out.mp4")
+    scripts = list((settings.work_dir / "render").rglob("*.cmd"))
+    assert len(scripts) == 1
+    assert scripts[0].parent.name.startswith("out-")      # readable stem + key
+
+
+def test_render_keeps_its_scratch_files_out_of_the_output_directory(
+    tmp_path: Path, vid: Path, settings
+):
+    """The defect: ``render`` wrote its sendcmd scripts next to the finished
+    video, littering the user's output directory with ``.<stem>-render/``."""
+    out = tmp_path / "clips" / "source-wide-01-part-1.mp4"
+    out.parent.mkdir(parents=True)
+
+    render(animated(vid), out, dry_run=True)
+
+    assert list(out.parent.iterdir()) == [], f"build litter in the output dir: {out.parent}"
+    assert list((settings.work_dir / "render").rglob("*.cmd"))
+
+
+def test_the_default_workdir_cannot_collide_between_concurrent_renders(
+    tmp_path: Path, vid: Path, settings
+):
+    """Two renders whose outputs merely share a stem used to share one scratch
+    directory, so each would overwrite the other's sendcmd scripts."""
+    def script_dir(out: Path) -> Path:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        cmd = build_command(animated(vid), out)
+        return Path(re.search(r"sendcmd=f=(\S+?),crop@", graph_of(cmd)).group(1)
+                    .replace("\\", "")).parent
+
+    one = script_dir(tmp_path / "a" / "out.mp4")
+    two = script_dir(tmp_path / "b" / "out.mp4")
+    assert one != two, "same scratch dir for two different outputs"
+    assert one.parent == two.parent == settings.work_dir / "render"
+    # ...but the same output is still the same (reproducible) directory
+    assert script_dir(tmp_path / "a" / "out.mp4") == one
 
 
 # --------------------------------------------------------------------------- #
@@ -1268,9 +1352,10 @@ def test_a_short_silent_render_is_not_blasted_to_full_scale(tmp_path: Path, make
     """The reason :data:`LOUDNESS_MIN_DURATION` exists.
 
     ffmpeg 6.1's ``loudnorm,alimiter`` pair hands back below-gate audio at
-    about 0 dBFS when the programme is shorter than three seconds -- a silent
-    2s render would come out as a full-scale blast.  The renderer skips
-    normalisation there instead.
+    about 0 dBFS when the filter is handed less than three seconds -- a silent
+    2s render would come out as a full-scale blast.  The renderer loops the
+    programme up to the floor before the filter sees it, so the gate engages
+    and silence stays silence *and* the short render is still normalised.
     """
     bg = make_video("bg.mp4", seconds=2.0, width=160, height=120, fps=12, audio=False)
     silent = ff.make_silence(2.0, tmp_path / "narration.wav")
@@ -1283,4 +1368,107 @@ def test_a_short_silent_render_is_not_blasted_to_full_scale(tmp_path: Path, make
 
     assert mean_volume(out, 0.1, 1.8) < -80.0, "a silent short render came out loud"
     assert loudness(out)[1] == float("-inf")
-    assert "loudnorm" not in graph_of(result.command)
+    assert "loudnorm" in graph_of(result.command)
+
+
+@pytest.mark.needs_ffmpeg
+def test_a_short_inaudible_render_stays_below_the_gate(tmp_path: Path, make_video):
+    """The other half of the short-programme blow-up: handed 2s directly,
+    ffmpeg 6.1's loudnorm hauls a -60 dBFS track up to about -2 LUFS."""
+    bg = make_video("bg.mp4", seconds=2.0, width=160, height=120, fps=12, audio=False)
+    whisper = tmp_path / "whisper.wav"
+    ff.run_ffmpeg(["-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+                   "-af", "volume=-60dB", "-c:a", "pcm_s16le", str(whisper)])
+    out = tmp_path / "whisper-short.mp4"
+
+    tl = Timeline(width=320, height=568, fps=12, duration=2.0)
+    tl.add_visual(VisualLayer(kind="video", src=str(bg), fit="cover"))
+    tl.add_audio(AudioTrack(src=str(whisper), role="voice"))
+    render(tl, out, options=FAST)
+
+    integrated, _ = loudness(out)
+    assert integrated <= -70.0, f"a 2s inaudible track was normalised up to {integrated} LUFS"
+    assert mean_volume(out, 0.1, 1.8) < -70.0
+
+
+@pytest.mark.needs_ffmpeg
+def test_there_is_no_loudness_step_at_the_three_second_boundary(tmp_path: Path, make_video):
+    """The defect: the same source measured -21.8 LUFS at 2.9s and -14.0 LUFS
+    at 3.0s -- a 7.8 dB cliff a caller cannot see, straddled by two clips out
+    of one batch."""
+    bg = make_video("bg.mp4", seconds=4.0, width=160, height=120, fps=12, audio=False)
+    voice = ff.make_tone(4.0, tmp_path / "voice.wav", frequency=220.0, volume=0.06)
+
+    def measure(duration: float) -> float:
+        out = tmp_path / f"d{duration}.mp4"
+        tl = Timeline(width=320, height=568, fps=12, duration=duration)
+        tl.add_visual(VisualLayer(kind="video", src=str(bg), fit="cover"))
+        tl.add_audio(AudioTrack(src=str(voice), role="voice"))
+        render(tl, out, options=FAST)
+        return loudness(out)[0]
+
+    below, above = measure(2.9), measure(3.0)
+    assert abs(below - above) <= 1.5, f"{below} LUFS at 2.9s vs {above} LUFS at 3.0s"
+    assert abs(below + 14.0) <= 1.5, f"2.9s exported at {below} LUFS, nowhere near -14"
+
+
+@pytest.mark.needs_ffmpeg
+def test_short_renders_land_on_the_target_across_the_whole_range(tmp_path: Path, make_video):
+    """Sampled across the sub-floor range: every duration reaches the target,
+    the curve has no step, and the limiter still holds the ceiling."""
+    bg = make_video("bg.mp4", seconds=4.0, width=160, height=120, fps=12, audio=False)
+    voice = ff.make_tone(4.0, tmp_path / "voice.wav", frequency=220.0, volume=0.06)
+
+    curve: dict[float, float] = {}
+    for duration in (0.5, 1.5, 2.5, 3.5):
+        out = tmp_path / f"c{duration}.mp4"
+        tl = Timeline(width=320, height=568, fps=12, duration=duration)
+        tl.add_visual(VisualLayer(kind="video", src=str(bg), fit="cover"))
+        tl.add_audio(AudioTrack(src=str(voice), role="voice"))
+        render(tl, out, options=FAST)
+        integrated, peak = loudness(out)
+        curve[duration] = integrated
+        assert peak < -0.5, f"{duration}s render peaks at {peak} dBFS"
+        assert abs(ff.probe(out).duration - duration) < 0.2, "the loop leaked into the output"
+
+    assert all(abs(value + 14.0) <= 1.5 for value in curve.values()), curve
+    assert max(curve.values()) - min(curve.values()) <= 1.5, curve
+
+
+@pytest.mark.needs_ffmpeg
+def test_a_looped_short_render_still_outputs_the_programme_not_a_repeat(
+    tmp_path: Path, make_video
+):
+    """Only the *filter* sees the looped mix: the audio that lands in the file
+    is the programme itself, so a clip that goes quiet stays quiet."""
+    bg = make_video("bg.mp4", seconds=2.0, width=160, height=120, fps=12, audio=False)
+    burst = tmp_path / "burst.wav"
+    ff.run_ffmpeg(["-y", "-f", "lavfi", "-i", "sine=frequency=300:duration=0.5",
+                   "-af", "volume=0.2,apad", "-t", "2.0", "-c:a", "pcm_s16le", str(burst)])
+    out = tmp_path / "burst.mp4"
+
+    tl = Timeline(width=320, height=568, fps=12, duration=2.0)
+    tl.add_visual(VisualLayer(kind="video", src=str(bg), fit="cover"))
+    tl.add_audio(AudioTrack(src=str(burst), role="voice"))
+    render(tl, out, options=FAST)
+
+    assert mean_volume(out, 0.05, 0.4) > -30.0, "the burst did not survive"
+    assert mean_volume(out, 1.0, 0.9) < -60.0, "a looped copy leaked into the output"
+
+
+@pytest.mark.needs_ffmpeg
+def test_a_real_render_leaves_nothing_but_the_output_file_behind(tmp_path: Path, make_video):
+    """The output directory receives the finished video and nothing else."""
+    bg = make_video("bg.mp4", seconds=2.0, width=160, height=120, fps=12, audio=False)
+    crop = CropPath(
+        [CropKeyframe(0.0, 0, 0, 80, 120), CropKeyframe(1.0, 80, 0, 80, 120)], 160, 120
+    )
+    out_dir = tmp_path / "delivery"
+    out = out_dir / "short.mp4"
+
+    tl = Timeline(width=320, height=568, fps=12, duration=2.0)
+    tl.add_visual(VisualLayer(kind="video", src=str(bg), crop=crop, fit="cover"))
+    render(tl, out, options=FAST)
+
+    assert "sendcmd" in graph_of(render(tl, out, options=FAST, dry_run=True).command)
+    assert [p.name for p in out_dir.iterdir()] == ["short.mp4"]

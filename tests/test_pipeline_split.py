@@ -523,3 +523,53 @@ def test_a_generated_name_lands_in_the_output_dir(env, wide: Path, plan: Recorde
 
     assert result.output.parent == env.output_dir
     assert result.output.name == "wide-split.mp4"
+
+
+# --------------------------------------------------------------------------- #
+# captions and the pane seam
+# --------------------------------------------------------------------------- #
+
+def test_a_centred_preset_is_re_seated_into_the_bottom_pane():
+    """The seam runs along the canvas centre, which is where a centred preset sits."""
+    from aiclipper.captions import PRESETS
+    from aiclipper.pipelines.split import caption_style_clear_of_seam
+
+    clean = PRESETS["clean"]
+    assert clean.position == "center", "this test is about the centred default"
+
+    moved = caption_style_clear_of_seam(clean, width=1080, height=1920)
+    assert moved.position == "bottom"
+    # The whole block has to live below the seam, i.e. in the lower half.
+    play_h = 1920
+    block = moved.font_size * 1.32 * split.CAPTION_LINES + split.CAPTION_CLEARANCE
+    assert play_h - moved.margin_v - block >= play_h / 2, "the block still crosses the seam"
+    # Nothing else about the look changes.
+    assert moved.font_size == clean.font_size
+    assert moved.primary_color == clean.primary_color
+    assert moved.animation == clean.animation
+
+
+def test_a_preset_that_already_clears_the_seam_is_untouched():
+    from aiclipper.captions import PRESETS
+    from aiclipper.pipelines.split import caption_style_clear_of_seam
+
+    lower = PRESETS["subtle_lower"]
+    assert lower.position == "bottom"
+    assert caption_style_clear_of_seam(lower, width=1080, height=1920) is lower
+    assert caption_style_clear_of_seam(None, width=1080, height=1920) is None
+
+
+def test_the_rendered_split_burns_its_captions_below_the_seam(env, wide: Path, plan: Recorder):
+    """End to end: the .ass the pipeline wrote must not be centred on the canvas."""
+    split.run(wide, bottom="slow_drift", narration=NARRATION)
+
+    subtitles = plan.timeline.subtitles
+    assert subtitles is not None
+    lines = subtitles.ass_path.read_text(encoding="utf-8").splitlines()
+    names = [f.strip() for f in next(ln for ln in lines if ln.startswith("Format:")).split(":", 1)[1].split(",")]
+    style_line = next(ln for ln in lines if ln.startswith("Style:"))
+    style = dict(zip(names, [f.strip() for f in style_line.split(":", 1)[1].split(",")], strict=True))
+
+    # 2 = bottom-centre; 5 would be dead centre of the canvas, i.e. on the seam.
+    assert int(style["Alignment"]) == 2, f"captions are still centred on the seam: {style_line}"
+    assert int(style["MarginV"]) > 0

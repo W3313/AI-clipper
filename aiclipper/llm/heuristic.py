@@ -258,6 +258,22 @@ def _rank_keywords(text: str, weight: int, counts: dict[str, int], order: dict[s
         order.setdefault(word, i)
 
 
+#: Fallback display names for a prompt that names nobody.  A person field --
+#: a chat contact, a message sender -- has to read as a person: a topic keyword
+#: put there produces a thread headed "Text" or "Lawn", which looks like a bug
+#: to whoever watches the video.  Picked deterministically from the prompt.
+_PERSON_NAMES: tuple[str, ...] = (
+    "Alex", "Robin", "Sam", "Jordan", "Casey", "Riley", "Morgan", "Taylor",
+    "Devon", "Quinn", "Harper", "Rowan", "Micah", "Noor", "Ira", "Dana",
+)
+
+
+def _fallback_person(keywords: list[str], seed: int | None) -> str:
+    """A plausible display name, stable for the same prompt and seed."""
+    key = f"{seed}:person:{'|'.join(keywords[:3])}"
+    return random.Random(key).choice(_PERSON_NAMES)
+
+
 def _proper_noun(text: str) -> str:
     """A name-ish token from the prompt: a mid-sentence capitalised word."""
     for match in list(_WORD_RE.finditer(text))[1:]:
@@ -327,7 +343,11 @@ def _material(prompt: str, seed: int) -> _Material:
         if len(numbers) >= 64:
             break
 
-    person = _proper_noun(payload) or ("" if subject else _proper_noun(text)) or _titlecase(keywords[0])
+    person = (
+        _proper_noun(payload)
+        or ("" if subject else _proper_noun(text))
+        or _fallback_person(keywords, seed)
+    )
     rng = random.Random(seed)
     # A subject too short to yield a sentence -- "cats" -- still has vocabulary,
     # and the filler shells built from that vocabulary are at least *about* it.
@@ -866,9 +886,11 @@ def _build_string(node: dict[str, Any], ctx: _Ctx, *, name: str, index: int) -> 
     elif fmt == "uuid":
         text = "00000000-0000-4000-8000-000000000000"
     elif "community" in lowered or "subreddit" in lowered or lowered == "forum":
-        text = "r/" + _slug(mat.take_keyword() + mat.take_keyword())
+        # Plain readable names, never a site-specific handle grammar: the story
+        # card is our own design and must not borrow another service's prefixes.
+        text = _titlecase(_slug(mat.take_keyword() + " " + mat.take_keyword(), sep=" "))
     elif "author" in lowered or "username" in lowered or "handle" in lowered or lowered == "user":
-        text = "u/" + _slug(mat.take_keyword() + mat.take_keyword())
+        text = _slug(mat.take_keyword() + " " + mat.take_keyword(), sep=" ")
     elif "hashtag" in lowered or lowered in ("tag", "tags"):
         # Indexed by array position, not the shared cursor, so a hashtag list
         # comes out as the prompt's strongest keywords rather than its dregs.

@@ -26,6 +26,15 @@ def seeded(seed: int = 1234) -> Settings:
     return replace(get_settings(), seed=seed)
 
 
+#: One specific real forum's handle grammar -- hard rule 6 says the card is our
+#: own design, so nothing we generate may carry it.
+SITE_PREFIX = re.compile(r"^/?[ru]/", re.IGNORECASE)
+
+
+def _has_site_prefix(name: str) -> bool:
+    return bool(SITE_PREFIX.match(name or ""))
+
+
 class FakeProvider:
     """Stands in for an LLM: returns a canned payload or raises."""
 
@@ -407,8 +416,10 @@ def test_write_reddit_is_deterministic_under_a_fixed_seed():
 def test_write_reddit_shape_and_body_budget():
     post = sg.write_reddit("my neighbour towed my car", words=140, settings=seeded(42))
     assert isinstance(post, RedditPost)
-    assert post.community.startswith("r/") and len(post.community) > 2
-    assert post.author.startswith("u/") and len(post.author) > 2
+    # our own card labelling: a plain community name and a plain author, never
+    # another forum's "r/" / "u/" handle grammar
+    assert not _has_site_prefix(post.community) and len(post.community) > 2
+    assert not _has_site_prefix(post.author) and len(post.author) > 2
     assert post.title.strip()
     assert post.upvotes > 0 and post.comments > 0
     assert post.comments < post.upvotes
@@ -420,10 +431,56 @@ def test_write_reddit_keeps_model_prose_and_normalises_handles():
     post = sg.write_reddit("locks", words=60, provider=FakeProvider(payload), settings=seeded(9))
     assert "my key did not turn" in post.body
     assert post.title == payload["title"]
-    assert post.community.startswith("r/")
-    assert post.author.startswith("u/")
+    assert post.community == "QuietDrama"
+    assert post.author == "spare room tenant"
     # engagement counts are derived from the seed, not taken from the model
     assert post.upvotes != payload["upvotes"]
+
+
+def test_write_reddit_strips_a_site_prefix_a_model_supplied():
+    """The payload arrives as "r/quietdrama" / "u/spareroomtenant"; we keep the
+    names and drop one specific real forum's handle grammar."""
+    post = sg.write_reddit("locks", words=60, provider=FakeProvider(GOOD_FORUM_PAYLOAD),
+                           settings=seeded(9))
+    assert not _has_site_prefix(post.community) and not _has_site_prefix(post.author)
+    assert post.community.casefold().endswith("quietdrama")
+    assert post.author == "spareroomtenant"
+
+
+@pytest.mark.parametrize(
+    "supplied, expected",
+    [
+        ("r/quietdrama", "quietdrama"),
+        ("/r/QuietDrama", "QuietDrama"),
+        ("u/spareroomtenant", "spareroomtenant"),
+        ("/U/Someone", "Someone"),
+        ("Quiet Drama", "Quiet Drama"),
+        ("", ""),
+        ("  ", ""),
+    ],
+)
+def test_strip_site_prefix(supplied, expected):
+    assert sg.strip_site_prefix(supplied) == expected
+
+
+def test_write_reddit_never_reuses_one_name_for_community_and_author():
+    """The offline provider slugs both fields from the same keyword; the card
+    must not read "Towed / by towed"."""
+    payload = dict(GOOD_FORUM_PAYLOAD, community="r/samestem", author="u/samestem")
+    post = sg.write_reddit("a tow truck", words=40, provider=FakeProvider(payload), settings=seeded(3))
+    assert post.community.casefold() != post.author.casefold()
+    assert not _has_site_prefix(post.author)
+
+
+def test_the_forum_prompt_asks_for_unprefixed_names():
+    from aiclipper.llm import prompts
+
+    system = prompts.FORUM_SYSTEM
+    assert "no `r/`" in system and "no `u/`" in system
+    for field in ("community", "author"):
+        described = prompts.FORUM_SCHEMA["properties"][field]["description"]
+        assert "no site prefix" in described
+        assert "r/" not in described and "u/" not in described
 
 
 # --------------------------------------------------------------------------- #
@@ -530,7 +587,7 @@ def test_generators_handle_empty_topics(topic):
     assert abs(sg.estimate_seconds(script) - 15) <= 1.5
     assert len(chat.messages) == 6 and all(m.text.strip() for m in chat.messages)
     assert post.title.strip() and post.body.strip()
-    assert post.community.startswith("r/")
+    assert post.community.strip() and not _has_site_prefix(post.community)
 
 
 def test_generators_are_offline_with_the_heuristic_provider():

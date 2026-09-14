@@ -6,14 +6,14 @@
       <div id="badge"></div>
       <div>
         <div id="community"></div>
-        <div id="author"></div>
+        <div id="byline"></div>
       </div>
     </div>
     <div id="title"></div>
     <div id="body"></div>
     <div id="row">
-      <div class="chip"><span class="arrow"></span><span id="votes"></span></div>
-      <div class="chip"><span class="speech"></span><span id="comments"></span></div>
+      <div class="chip"><span class="mark score"><i></i><i></i><i></i></span><span id="votes"></span></div>
+      <div class="chip"><span class="mark replies"><i></i><i></i></span><span id="comments"></span></div>
     </div>
   </div>
 </div>
@@ -40,8 +40,12 @@
       applyTheme(data.vars);
       document.body.setAttribute("data-theme", data.theme || "dark");
       document.getElementById("badge").textContent = data.badge || "";
+      // Python has already stripped any borrowed site prefix and built the
+      // byline -- the card's own labelling, not another forum's handle grammar.
       document.getElementById("community").textContent = data.community || "";
-      document.getElementById("author").textContent = data.author || "";
+      var byline = document.getElementById("byline");
+      byline.textContent = data.byline || "";
+      byline.className = data.byline ? "" : "empty";
       document.getElementById("title").textContent = data.title || "";
       var body = document.getElementById("body");
       var excerpt = trim(data.body, 320);

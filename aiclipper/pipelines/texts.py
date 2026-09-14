@@ -539,16 +539,62 @@ def _synthesise(
     theirs: VoiceSpec,
     settings: Settings,
     speaker: Any,
-) -> tuple[list[TTSResult | None], list[Path | None], list[float]]:
-    """Speak every spoken message into its own file.
+) -> tuple[list[TTSResult | None], list[Path | None], list[float], str]:
+    """Speak every spoken message, falling back a whole backend at a time.
 
-    Returns three lists the length of ``script.messages``: the raw
+    Returns three lists the length of ``script.messages`` -- the raw
     :class:`~aiclipper.models.TTSResult` (``None`` for a silent message), its
-    audio path, and the hold each message takes on the clock.
+    audio path, and the hold each message takes on the clock -- plus the name of
+    the backend that really spoke.
+
+    A backend that raises part-way through (a dead network on message 3, an
+    expired key) does not kill the render.  The conversation is spoken *again
+    from the first message* by the next backend in
+    :func:`aiclipper.tts.fallback_chain`, ending at the always-there offline
+    backend -- the same whole-narration-at-a-time rule
+    :func:`aiclipper.tts.synthesize_lines` follows, and for the same reason: a
+    thread whose first two bubbles are one voice and whose rest is another is
+    worse than either voice alone.
     """
     vo_dir = work / "vo"
     vo_dir.mkdir(parents=True, exist_ok=True)
 
+    chain = tts.fallback_chain(speaker, settings=settings)
+    failure: Exception | None = None
+    for index, candidate in enumerate(chain):
+        name = str(getattr(candidate, "name", "") or "tts")
+        try:
+            spoken = _speak_messages(
+                script, vo_dir, mine=mine, theirs=theirs, settings=settings, speaker=candidate
+            )
+        except Exception as exc:  # noqa: BLE001 - any backend failure is recoverable
+            failure = exc
+            following = chain[index + 1:]
+            if not following:
+                break
+            log.warning(
+                "tts backend %r failed (%s); re-synthesising the whole conversation with %r "
+                "so each side keeps one voice",
+                name, exc, str(getattr(following[0], "name", "") or "tts"),
+            )
+            continue
+        return (*spoken, name)
+
+    if failure is None:  # pragma: no cover - the loop only leaves here on a failure
+        raise AiclipperError("no tts backend was available to speak this conversation")
+    raise failure
+
+
+def _speak_messages(
+    script: ChatScript,
+    vo_dir: Path,
+    *,
+    mine: VoiceSpec,
+    theirs: VoiceSpec,
+    settings: Settings,
+    speaker: Any,
+) -> tuple[list[TTSResult | None], list[Path | None], list[float]]:
+    """One pass of :func:`_synthesise` with a single, already-chosen backend."""
     results: list[TTSResult | None] = []
     paths: list[Path | None] = []
     holds: list[float] = []
@@ -824,7 +870,7 @@ def run(
 
     mine, theirs = _side_voices(voice, reply_voice, s)
     speaker = tts.get_provider(settings=s)
-    results, paths, holds = _synthesise(
+    results, paths, holds, tts_provider = _synthesise(
         chat, work, mine=mine, theirs=theirs, settings=s, speaker=speaker
     )
 
@@ -874,7 +920,11 @@ def run(
         width=width, height=height, enabled=captions, settings=s,
     )
 
-    out = common.resolve_output(out_path, title, s)
+    # The default file name comes from what the *caller* asked for, the way
+    # ``story`` and ``reddit`` name theirs: a generated headline is an invention,
+    # and a file called after one is hard to find again.  Only a conversation
+    # supplied without a topic has nothing but its title to be named after.
+    out = common.resolve_output(out_path, (topic or "").strip() or title, s)
     rendered = render_module.render(timeline, out, settings=s)
 
     voice_names = [
@@ -890,7 +940,7 @@ def run(
             "topic": (topic or "").strip(),
             "script_source": source,
             "provider": provider_name,
-            "tts_provider": common.provider_name(speaker),
+            "tts_provider": tts_provider,
             "theme": chat.theme,
             "backend": used_backend,
             "backend_requested": (backend or "").strip().lower() or "auto",

@@ -39,6 +39,7 @@ __all__ = [
     "parse_chat",
     "parse_script",
     "format_chat",
+    "strip_site_prefix",
 ]
 
 #: Spoken words per second used to budget a script against a target duration.
@@ -938,8 +939,11 @@ def write_reddit(
     )
     if not post.title:
         post.title = _titlecase(subject, 12) or "Something happened and I still think about it"
-    post.community = _forum_name(post.community, subject, cfg, prefix="r/")
-    post.author = _forum_name(post.author, subject, cfg, prefix="u/")
+    post.community = _forum_name(post.community, subject, cfg, kind="community")
+    post.author = _forum_name(post.author, subject, cfg, kind="author")
+    if post.author.casefold() == post.community.casefold():
+        # a model that reuses one slug for both would give us "X / by X"
+        post.author = _forum_name("", subject, cfg, kind="author")
     post.upvotes, post.comments = engagement(subject, cfg.seed)
     post.theme = post.theme or "dark"
     return post
@@ -969,27 +973,47 @@ def _template_post(topic: str, settings: Settings) -> RedditPost:
         ]
     )
     return RedditPost(
-        community=_forum_name("", topic, settings, prefix="r/"),
-        author=_forum_name("", topic, settings, prefix="u/"),
+        community=_forum_name("", topic, settings, kind="community"),
+        author=_forum_name("", topic, settings, kind="author"),
         title=_titlecase(topic, 12) or "I did not expect this to get out of hand",
         body=body,
         theme="dark",
     )
 
 
-def _forum_name(current: str, topic: str, settings: Settings, *, prefix: str) -> str:
-    name = (current or "").strip()
+#: A borrowed ``r/``/``u/`` handle prefix from one specific real forum.  The card
+#: is our own design and labels its own fields, so we never *write* one -- and a
+#: model or a user that supplies one has it stripped rather than rejected.
+_SITE_PREFIX_RE = re.compile(r"^/?[ru]/", re.IGNORECASE)
+
+#: Invented community names and author handles -- ours, in plain words.
+_COMMUNITY_NAMES = (
+    "Stories From Work", "Quiet Drama", "Told You So",
+    "The Small Print", "Late Night Tales", "This Took A Turn",
+)
+_AUTHOR_NAMES = (
+    "quiet desk plant", "box of cables", "third floor window",
+    "no longer on the rota", "spare room tenant",
+)
+
+
+def strip_site_prefix(name: str) -> str:
+    """``"r/quietdrama"`` -> ``"quietdrama"``; anything else is passed through."""
+    return _SITE_PREFIX_RE.sub("", (name or "").strip(), count=1).strip()
+
+
+def _forum_name(current: str, topic: str, settings: Settings, *, kind: str) -> str:
+    """A plain, unprefixed community name or author name for the story card."""
+    name = strip_site_prefix(current)
     if name:
-        stem = name.split("/", 1)[1] if "/" in name else name
-        stem = re.sub(r"[^0-9A-Za-z_]", "", stem).lower()
-        if stem:
-            return f"{prefix}{stem[:24]}"
-    rng = _rng(topic, prefix, seed=settings.seed)
-    if prefix == "r/":
-        stems = ("storiesfromwork", "quietdrama", "toldyouso", "smallprint", "latenighttales", "thistookaturn")
-    else:
-        stems = ("quietdeskplant", "boxofcables", "thirdfloorwindow", "nolongerontherota", "spareroomtenant")
-    return f"{prefix}{rng.choice(stems)}"
+        cleaned = re.sub(r"\s+", " ", re.sub(r"[^0-9A-Za-z _'&-]+", " ", name)).strip(" -_")[:32].strip()
+        if cleaned and kind == "community":
+            # a community reads as a label, so give it initial capitals
+            cleaned = " ".join(word[:1].upper() + word[1:] for word in cleaned.split())
+        if cleaned:
+            return cleaned
+    rng = _rng(topic, kind, seed=settings.seed)
+    return rng.choice(_COMMUNITY_NAMES if kind == "community" else _AUTHOR_NAMES)
 
 
 def engagement(topic: str, seed: int) -> tuple[int, int]:

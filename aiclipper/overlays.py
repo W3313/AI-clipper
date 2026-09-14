@@ -54,6 +54,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -80,6 +81,8 @@ __all__ = [
     "TEMPLATE_DIR",
     "BACKENDS",
     "chat_states",
+    "plain_name",
+    "byline",
     "render_chat",
     "render_forum_card",
     "available_backends",
@@ -187,6 +190,7 @@ class ForumTheme:
     shadow_alpha: float = 0.45
     outline: str = "#000000"
     outline_alpha: float = 0.10
+    rule_alpha: float = 0.16          # hairline above the engagement row
 
     # -- geometry ---------------------------------------------------------- #
     font_w: float = 0.0300          # base font size
@@ -202,14 +206,17 @@ class ForumTheme:
     body_line: float = 1.34
     gap_title_em: float = 0.95      # meta row -> title
     gap_body_em: float = 0.90       # title -> excerpt
-    gap_row_em: float = 1.25        # excerpt -> chip row
+    gap_row_em: float = 1.15        # excerpt -> hairline
+    rule_gap_em: float = 0.95       # hairline -> engagement row
     chip_h_em: float = 2.30
     chip_pad_em: float = 0.70
     chip_gap_em: float = 0.70
-    icon_em: float = 0.52
+    icon_em: float = 0.66           # engagement mark unit (mark box is 1.5x this)
+    mark_gap_em: float = 0.50       # mark -> its count
     badge_text_em: float = 1.05     # community badge letter
     meta_gap_em: float = 0.60       # badge -> community name
-    author_gap_em: float = 0.18     # community name -> author
+    author_em: float = 0.94         # byline font size (quieter than the community)
+    author_gap_em: float = 0.20     # community name -> byline
     shadow_drop_em: float = 0.55
     shadow_blur_em: float = 0.90
     edge_em: float = 0.06
@@ -392,9 +399,26 @@ def _initials(text: str, limit: int = 2) -> str:
     return "".join(letters[:limit]).upper() or "?"
 
 
+#: A borrowed ``r/``/``u/`` (or ``/r/``, ``/u/``) handle prefix from one specific
+#: real forum.  Our card labels its own fields, so it is stripped for display --
+#: callers may still store whatever string they like on the post.
+_SITE_PREFIX_RE = re.compile(r"^/?[ru]/", re.IGNORECASE)
+
+
+def plain_name(value: str) -> str:
+    """``"r/nightshift"`` -> ``"nightshift"``; anything else is passed through."""
+    return _SITE_PREFIX_RE.sub("", (value or "").strip(), count=1).strip()
+
+
+def byline(author: str) -> str:
+    """Our own author labelling: ``"u/quietcorridor"`` -> ``"by quietcorridor"``."""
+    name = plain_name(author)
+    return f"by {name}" if name else ""
+
+
 def _badge_letter(community: str) -> str:
     """First meaningful letter of a community name (``"r/nightshift"`` -> ``"N"``)."""
-    name = (community or "").strip()
+    name = plain_name(community)
     if "/" in name:
         name = name.rsplit("/", 1)[-1]
     return _initials(name or community or "?", 1)
@@ -951,6 +975,19 @@ def _render_chat_pillow(
 # forum card metrics (shared by both backends)
 # --------------------------------------------------------------------------- #
 
+# Our own engagement marks, as fractions of the mark box -- one definition for
+# both backends.  ``score`` is three rising bars, ``replies`` two stacked bars;
+# deliberately abstract geometry, borrowed from no existing service's icon set.
+_MARK_W_UNITS = 1.5             # mark box width, in ``icon`` units
+_MARK_H_UNITS = 1.4             # mark box height, in ``icon`` units
+#: score mark: ``(left, height)`` per bar, fractions of the mark box.
+_SCORE_BARS = ((0.00, 0.40), (0.38, 0.68), (0.76, 1.00))
+_SCORE_BAR_W = 0.24             # bar width, fraction of the mark box width
+#: replies mark: ``(top, width)`` per bar, fractions of the mark box.
+_REPLY_BARS = ((0.16, 1.00), (0.60, 0.55))
+_REPLY_BAR_H = 0.24             # bar height, fraction of the mark box height
+
+
 @dataclass(frozen=True)
 class _ForumMetrics:
     """A :class:`ForumTheme` resolved against one canvas, in device pixels."""
@@ -968,6 +1005,8 @@ class _ForumMetrics:
     badge_size: int
     meta_size: int
     meta_line: int
+    author_size: int
+    author_line: int
     author_gap: int
     meta_gap: int
     meta_h: int
@@ -978,10 +1017,14 @@ class _ForumMetrics:
     gap_title: int
     gap_body: int
     gap_row: int
+    rule_gap: int
     chip_h: int
     chip_pad: int
     chip_gap: int
     icon: int
+    mark_w: int
+    mark_h: int
+    mark_gap: int
     edge: int
     shadow_drop: int
     shadow_blur: int
@@ -998,8 +1041,11 @@ def _forum_metrics(theme: ForumTheme, width: int, height: int, scale: int = 1) -
     card_w = w - 2 * margin
     badge_d = round(base * theme.badge_em)
     meta_line = round(base * theme.meta_line)
+    author_size = max(8, round(base * theme.author_em))
+    author_line = round(author_size * theme.meta_line)
     author_gap = round(base * theme.author_gap_em)
-    meta_h = max(badge_d, 2 * meta_line + author_gap)
+    meta_h = max(badge_d, meta_line + author_gap + author_line)
+    icon = round(base * theme.icon_em)
     return _ForumMetrics(
         w=w, h=h, base=base, margin=margin, card_w=card_w, pad=pad,
         inner=card_w - 2 * pad,
@@ -1007,7 +1053,8 @@ def _forum_metrics(theme: ForumTheme, width: int, height: int, scale: int = 1) -
         stage_pad=round(h * theme.stage_pad_h),
         badge_d=badge_d,
         badge_size=max(8, round(base * theme.badge_text_em)),
-        meta_size=base, meta_line=meta_line, author_gap=author_gap,
+        meta_size=base, meta_line=meta_line,
+        author_size=author_size, author_line=author_line, author_gap=author_gap,
         meta_gap=round(base * theme.meta_gap_em), meta_h=meta_h,
         title_size=max(10, round(base * theme.title_em)),
         title_lh=round(base * theme.title_em * theme.title_line),
@@ -1016,10 +1063,14 @@ def _forum_metrics(theme: ForumTheme, width: int, height: int, scale: int = 1) -
         gap_title=round(base * theme.gap_title_em),
         gap_body=round(base * theme.gap_body_em),
         gap_row=round(base * theme.gap_row_em),
+        rule_gap=round(base * theme.rule_gap_em),
         chip_h=round(base * theme.chip_h_em),
         chip_pad=round(base * theme.chip_pad_em),
         chip_gap=round(base * theme.chip_gap_em),
-        icon=round(base * theme.icon_em),
+        icon=icon,
+        mark_w=round(icon * _MARK_W_UNITS),
+        mark_h=round(icon * _MARK_H_UNITS),
+        mark_gap=round(base * theme.mark_gap_em),
         edge=max(1, round(base * theme.edge_em)),
         shadow_drop=round(base * theme.shadow_drop_em),
         shadow_blur=round(base * theme.shadow_blur_em),
@@ -1042,8 +1093,11 @@ def _forum_css_vars(theme: ForumTheme, m: _ForumMetrics, emoji_family: str) -> d
         "--badge-fg": theme.badge_fg,
         "--shadow": _css_rgba(theme.shadow, theme.shadow_alpha),
         "--edge": _css_rgba(theme.outline, theme.outline_alpha),
+        "--rule": _css_rgba(theme.outline, theme.rule_alpha),
         "--fs": f"{m.meta_size}px",
         "--meta-line": f"{m.meta_line}px",
+        "--author-fs": f"{m.author_size}px",
+        "--author-line": f"{m.author_line}px",
         "--author-gap": f"{m.author_gap}px",
         "--meta-gap": f"{m.meta_gap}px",
         "--meta-h": f"{m.meta_h}px",
@@ -1056,10 +1110,13 @@ def _forum_css_vars(theme: ForumTheme, m: _ForumMetrics, emoji_family: str) -> d
         "--gap-title": f"{m.gap_title}px",
         "--gap-body": f"{m.gap_body}px",
         "--gap-row": f"{m.gap_row}px",
+        "--rule-gap": f"{m.rule_gap}px",
         "--chip-h": f"{m.chip_h}px",
         "--chip-pad": f"{m.chip_pad}px",
         "--chip-gap": f"{m.chip_gap}px",
-        "--icon": f"{m.icon}px",
+        "--mark-w": f"{m.mark_w}px",
+        "--mark-h": f"{m.mark_h}px",
+        "--mark-gap": f"{m.mark_gap}px",
         "--edge-w": f"{m.edge}px",
         "--card-margin": f"{m.margin}px",
         "--card-pad": f"{m.pad}px",
@@ -1076,6 +1133,23 @@ def _forum_css_vars(theme: ForumTheme, m: _ForumMetrics, emoji_family: str) -> d
 # forum card (pillow backend)
 # --------------------------------------------------------------------------- #
 
+def _draw_score_mark(d: PilDraw, x: float, y: float, w: float, h: float, ink: tuple[int, ...]) -> None:
+    """Our score mark: three rising bars, bottom aligned in the ``w`` x ``h`` box."""
+    bar_w = w * _SCORE_BAR_W
+    for left, tall in _SCORE_BARS:
+        bx = x + w * left
+        d.rounded_rectangle((bx, y + h * (1.0 - tall), bx + bar_w, y + h),
+                            radius=bar_w / 2.0, fill=ink)
+
+
+def _draw_replies_mark(d: PilDraw, x: float, y: float, w: float, h: float, ink: tuple[int, ...]) -> None:
+    """Our replies mark: two stacked bars, centred in the ``w`` x ``h`` box."""
+    bar_h = h * _REPLY_BAR_H
+    for top, wide in _REPLY_BARS:
+        by = y + h * top
+        d.rounded_rectangle((x, by, x + w * wide, by + bar_h), radius=bar_h / 2.0, fill=ink)
+
+
 def _render_forum_pillow(
     post: RedditPost,
     out_path: Path,
@@ -1089,10 +1163,10 @@ def _render_forum_pillow(
     theme = _forum_theme(post.theme)
     fm = _forum_metrics(theme, width, height, scale)
     w, h = fm.w, fm.h
-    base = fm.base
 
-    f_meta = _load_font(settings, fm.meta_size, bold=False)
+    f_meta = _load_font(settings, fm.author_size, bold=False)
     f_meta_b = _load_font(settings, fm.meta_size, bold=True)
+    f_count = _load_font(settings, fm.meta_size, bold=True)
     f_title = _load_font(settings, fm.title_size, bold=True)
     f_body = _load_font(settings, fm.body_size, bold=False)
     f_badge = _load_font(settings, fm.badge_size, bold=True)
@@ -1121,7 +1195,7 @@ def _render_forum_pillow(
         total = pad * 2 + meta_h + gap_title + n_title * title_lh
         if n_body:
             total += gap_body + n_body * body_lh
-        return total + gap_row + chip_h
+        return total + gap_row + fm.edge + fm.rule_gap + chip_h
 
     # An over-long title or body must never push the card (and its vote chips)
     # off the canvas: trim the excerpt first, then the title, adding an ellipsis.
@@ -1167,14 +1241,15 @@ def _render_forum_pillow(
     d.text((cx + br, bcy), _badge_letter(post.community), font=f_badge,
            fill=_rgba(theme.badge_fg), anchor="mm")
     tx = cx + badge_d + fm.meta_gap
-    community = (post.community or "").strip()
-    author = (post.author or "").strip()
-    stack_h = fm.meta_line * (2 if author else 1) + (fm.author_gap if author else 0)
-    ty = bcy - stack_h // 2 + max(0, (fm.meta_line - _line_height(f_meta_b)) // 2)
-    d.text((tx, ty), community, font=f_meta_b, fill=_rgba(theme.accent), anchor="la")
-    if author:
-        d.text((tx, ty + fm.meta_line + fm.author_gap), author, font=f_meta,
-               fill=_rgba(theme.meta_fg), anchor="la")
+    community = plain_name(post.community)
+    line = byline(post.author)
+    stack_h = fm.meta_line + (fm.author_gap + fm.author_line if line else 0)
+    top = bcy - stack_h // 2
+    d.text((tx, top + max(0, (fm.meta_line - _line_height(f_meta_b)) // 2)), community,
+           font=f_meta_b, fill=_rgba(theme.accent), anchor="la")
+    if line:
+        ly = top + fm.meta_line + fm.author_gap + max(0, (fm.author_line - _line_height(f_meta)) // 2)
+        d.text((tx, ly), line, font=f_meta, fill=_rgba(theme.meta_fg), anchor="la")
 
     cy += meta_h + gap_title
     for line in title_lines:
@@ -1187,31 +1262,28 @@ def _render_forum_pillow(
             d.text((cx, cy + body_dy), line, font=f_body, fill=_rgba(theme.body_fg))
             cy += body_lh
 
+    # a hairline separates the story from its counts, so the counts read as the
+    # quiet secondary information they are
+    cy = y1 - pad - chip_h - fm.rule_gap - fm.edge
+    d.rectangle((cx, cy, cx + inner, cy + fm.edge - 1), fill=_rgba(theme.outline, theme.rule_alpha))
+
     cy = y1 - pad - chip_h
-    chip_pad = fm.chip_pad
-    icon = fm.icon
+    chip_pad, mark_gap = fm.chip_pad, fm.mark_gap
+    mark_w, mark_h = fm.mark_w, fm.mark_h
+    my = cy + (chip_h - mark_h) / 2.0
 
-    votes = _short_count(post.upvotes)
-    chip1_w = chip_pad * 2 + icon * 2 + round(base * 0.5) + round(_text_width(f_meta_b, votes))
-    d.rounded_rectangle((cx, cy, cx + chip1_w, cy + chip_h), radius=chip_h // 2, fill=_rgba(theme.chip_bg))
-    acx = cx + chip_pad + icon
-    acy = cy + chip_h // 2
-    d.polygon([(acx, acy - icon), (acx - icon, acy + icon * 0.5), (acx + icon, acy + icon * 0.5)],
-              fill=_rgba(theme.accent))
-    d.text((acx + icon + round(base * 0.5), acy), votes, font=f_meta_b,
-           fill=_rgba(theme.chip_fg), anchor="lm")
-
-    comments = _short_count(post.comments)
-    cx2 = cx + chip1_w + fm.chip_gap
-    chip2_w = chip_pad * 2 + icon * 2 + round(base * 0.5) + round(_text_width(f_meta_b, comments))
-    d.rounded_rectangle((cx2, cy, cx2 + chip2_w, cy + chip_h), radius=chip_h // 2, fill=_rgba(theme.chip_bg))
-    bx = cx2 + chip_pad
-    d.rounded_rectangle((bx, acy - icon, bx + icon * 2, acy + icon * 0.7),
-                        radius=max(2, round(icon * 0.45)), fill=_rgba(theme.chip_fg))
-    d.polygon([(bx + icon * 0.45, acy + icon * 0.6), (bx + icon * 1.05, acy + icon * 0.6),
-               (bx + icon * 0.5, acy + icon * 1.35)], fill=_rgba(theme.chip_fg))
-    d.text((cx2 + chip_pad + icon * 2 + round(base * 0.5), acy), comments, font=f_meta_b,
-           fill=_rgba(theme.chip_fg), anchor="lm")
+    for value, draw_mark, ink in (
+        (post.upvotes, _draw_score_mark, theme.accent),
+        (post.comments, _draw_replies_mark, theme.chip_fg),
+    ):
+        text = _short_count(int(value))
+        chip_w = chip_pad * 2 + mark_w + mark_gap + round(_text_width(f_count, text))
+        d.rounded_rectangle((cx, cy, cx + chip_w, cy + chip_h), radius=chip_h // 2,
+                            fill=_rgba(theme.chip_bg))
+        draw_mark(d, cx + chip_pad, my, mark_w, mark_h, _rgba(ink))
+        d.text((cx + chip_pad + mark_w + mark_gap, cy + chip_h // 2), text, font=f_count,
+               fill=_rgba(theme.chip_fg), anchor="lm")
+        cx += chip_w + fm.chip_gap
 
     out = _downsample(img, scale)
     out.save(out_path)
@@ -1391,8 +1463,8 @@ def _render_forum_chromium(
     html = _page_html("forum.html", "forum.css")
     theme = _forum_theme(post.theme)
     payload = {
-        "community": post.community,
-        "author": post.author,
+        "community": plain_name(post.community),
+        "byline": byline(post.author),
         "title": post.title,
         "body": post.body,
         "upvotes": _short_count(post.upvotes),

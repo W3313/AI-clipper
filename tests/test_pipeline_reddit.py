@@ -449,8 +449,9 @@ def test_a_generated_post_names_its_provider_and_is_narrated(env):
     meta = result.metadata
     assert meta["post_source"] == "generated"
     assert meta["provider"] == "heuristic"
-    assert meta["community"].startswith("r/")
-    assert meta["author"].startswith("u/")
+    # generated names are our own plain labels, never a real forum's "r/"/"u/"
+    assert meta["community"] and not re.match(r"^/?[ru]/", meta["community"], re.IGNORECASE)
+    assert meta["author"] and not re.match(r"^/?[ru]/", meta["author"], re.IGNORECASE)
     assert meta["title"]
     assert meta["body_paragraphs"] >= 1
     assert meta["caption_words"] > 0
