@@ -1,14 +1,16 @@
 """The provider interface every speech backend implements.
 
-Three backends exist -- :class:`~aiclipper.tts.edge.EdgeTTS` (free, network,
+Four backends exist -- :class:`~aiclipper.tts.edge.EdgeTTS` (free, network,
 gives word boundaries), :class:`~aiclipper.tts.eleven.ElevenLabsTTS` (keyed,
-network, no word boundaries) and :class:`~aiclipper.tts.offline.OfflineTTS`
-(timed silence, always available).  Callers never construct one directly; they
-ask :func:`get_provider` and program against :class:`TTSProvider`.
+network, no word boundaries), :class:`~aiclipper.tts.piper.PiperTTS` (local
+neural speech from a downloaded ``.onnx`` voice, no network, no word boundaries)
+and :class:`~aiclipper.tts.offline.OfflineTTS` (timed silence, always
+available).  Callers never construct one directly; they ask :func:`get_provider`
+and program against :class:`TTSProvider`.
 
-Both network backends are imported lazily inside :func:`get_provider` and never
-import their third-party dependency at module scope, so ``import aiclipper.tts``
-stays cheap and safe on a bare interpreter.
+Every backend is imported lazily inside :func:`get_provider` and none imports
+its third-party dependency (or runs its binary) at module scope, so ``import
+aiclipper.tts`` stays cheap and safe on a bare interpreter.
 
 **Two different questions, two different calls.**  ``provider.available()`` is a
 *routing* check: dependency, credential and offline flags only, no network, fast
@@ -25,9 +27,12 @@ are cached for the life of the process, so a diagnostic pays for them once.
 :func:`fallback_chain`: when the selected backend raises part way through a
 narration the whole narration is re-synthesised with the next usable backend,
 ending at :class:`~aiclipper.tts.offline.OfflineTTS`, which needs nothing but
-ffmpeg.  Re-doing every line rather than continuing from the failure is the
-point: half a narration in one voice and half in another is a broken video, and
-a render that finishes in the offline voice beats a render that dies.  The
+ffmpeg -- via :class:`~aiclipper.tts.piper.PiperTTS` when a local voice is
+installed, because a real voice that no network blip can take away is a much
+better degradation target than silence.  Re-doing every line rather than
+continuing from the failure is the point: half a narration in one voice and half
+in another is a broken video, and a render that finishes in the offline voice
+beats a render that dies.  The
 backend that actually spoke is reported on the returned
 :class:`NarrationResults`, so pipelines can record it in their metadata.
 """
@@ -63,9 +68,12 @@ T = TypeVar("T")
 PROVIDER_ALIASES: dict[str, str] = {**_VOICE_ALIASES, "silent": "offline"}
 
 #: Order :func:`fallback_chain` degrades through when a backend fails at
-#: runtime.  ``offline`` is last and unconditional: it needs only ffmpeg, so it
-#: is the floor below which a render cannot fall.
-FALLBACK_ORDER: tuple[str, ...] = ("edge", "elevenlabs", "offline")
+#: runtime.  ``piper`` sits directly ahead of ``offline``: it is local, so
+#: unlike the two network backends it cannot fail from a blip, an expired key or
+#: a rate limit, which makes it the last chance at a real voice.  ``offline`` is
+#: last and unconditional: it needs only ffmpeg, so it is the floor below which
+#: a render cannot fall.
+FALLBACK_ORDER: tuple[str, ...] = ("edge", "elevenlabs", "piper", "offline")
 
 #: Wall-clock bound, in seconds, on one :func:`provider_usable` probe.  A
 #: diagnostic that hangs is a diagnostic nobody runs.
@@ -118,9 +126,12 @@ def get_provider(name: str | None = None, *, settings: Settings | None = None) -
     :class:`~aiclipper.tts.edge.EdgeTTS` when ``edge_tts`` is importable and
     ``settings.offline`` is false, then
     :class:`~aiclipper.tts.eleven.ElevenLabsTTS` when ``ELEVENLABS_API_KEY`` is
-    set, and finally :class:`~aiclipper.tts.offline.OfflineTTS`, which is always
-    available.  An unrecognised name raises
-    :class:`~aiclipper.errors.TTSError`.
+    set, then :class:`~aiclipper.tts.piper.PiperTTS` when Piper is installed
+    locally -- offline or not, since it needs no network -- and finally
+    :class:`~aiclipper.tts.offline.OfflineTTS`, which is always available.  The
+    same reasoning as :data:`FALLBACK_ORDER`: picking silence over an installed
+    local voice would be a strange thing to do automatically.  An unrecognised
+    name raises :class:`~aiclipper.errors.TTSError`.
 
     Naming an unavailable backend explicitly still returns it -- so the caller
     gets that backend's own diagnostic (a ``MissingDependency`` naming the pip
@@ -149,12 +160,20 @@ def get_provider(name: str | None = None, *, settings: Settings | None = None) -
     if canonical == "elevenlabs":
         return ElevenLabsTTS(settings=s)
 
+    from .piper import PiperTTS
+
+    if canonical == "piper":
+        return PiperTTS(settings=s)
+
     edge = EdgeTTS(settings=s)
     if edge.available():
         return edge
     eleven = ElevenLabsTTS(settings=s)
     if eleven.available():
         return eleven
+    piper = PiperTTS(settings=s)
+    if piper.available():
+        return piper
     return OfflineTTS(settings=s)
 
 
@@ -448,9 +467,9 @@ def provider_usable(
     This is what a ``doctor``-style diagnostic should call.  ``available()``
     only proves the import worked or the key is a non-empty string; this runs
     the backend's own probe -- a voice-list fetch for edge, a cheap authenticated
-    GET for ElevenLabs, an ffmpeg check for offline -- bounded by ``timeout``
-    (default :data:`USABLE_TIMEOUT`) and cached for the process, so "OK" means
-    the next render will actually produce audio.
+    GET for ElevenLabs, one tiny local synthesis for piper, an ffmpeg check for
+    offline -- bounded by ``timeout`` (default :data:`USABLE_TIMEOUT`) and cached
+    for the process, so "OK" means the next render will actually produce audio.
 
     A backend with no ``usable()`` of its own (a third-party provider, a test
     double) degrades to ``available()``.  Never raises: an unusable backend and

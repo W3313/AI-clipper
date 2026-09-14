@@ -85,7 +85,7 @@ OPTIONAL_EXTRAS: tuple[tuple[str, str, str], ...] = (
     ("playwright", "playwright", "overlays"),
 )
 
-_TTS_BACKENDS = ("edge", "elevenlabs", "offline")
+_TTS_BACKENDS = ("edge", "elevenlabs", "piper", "offline")
 
 #: Floors for the numeric options.  A degenerate value (no clips, a fifth of a
 #: second of video) is a usage error, not something to render and then explain.
@@ -710,10 +710,41 @@ def _ffprobe_probe(settings: Settings) -> tuple[bool, str]:
 
 
 def _llm_report(settings: Settings) -> tuple[bool, str]:
+    """Installed is not usable, the same rule the ``tts:`` rows follow.
+
+    ``available()`` only says a credential is a non-empty string or that a base
+    URL is configured -- which is how a machine with nothing listening on that
+    URL would still report ``OK``.  A backend that offers the stronger
+    ``usable()`` probe (the local one does) is asked that instead, under a bound,
+    so a configured-but-dead endpoint is caught here rather than halfway through
+    a render.
+    """
     from . import llm
+    from .tts.base import run_bounded
 
     provider = llm.get_provider(settings=settings)
-    return bool(provider.available()), f"{settings.llm_provider!r} resolves to {provider.name}"
+    resolves = f"{settings.llm_provider!r} resolves to {provider.name}"
+    try:
+        installed = bool(provider.available())
+    except Exception:  # noqa: BLE001 - doctor reports, it does not crash
+        log.debug("llm backend %r failed its availability check", provider.name, exc_info=True)
+        installed = False
+
+    probe = getattr(provider, "usable", None)
+    if not callable(probe):
+        return installed, resolves
+    if not installed:
+        return False, f"{resolves}, which is not configured here"
+    def _probe() -> bool:
+        try:
+            return bool(probe())
+        except Exception:  # noqa: BLE001 - an unreachable endpoint is a row, not a crash
+            log.debug("llm backend %r failed its usability probe", provider.name, exc_info=True)
+            return False
+
+    if run_bounded(_probe, DOCTOR_TTS_TIMEOUT, default=False):
+        return True, f"{resolves}, serving {getattr(provider, 'model', '?')!r}"
+    return False, f"{resolves}, but nothing is answering at {getattr(provider, 'chat_url', '?')}"
 
 
 def _transcribe_report(settings: Settings) -> tuple[bool, str]:

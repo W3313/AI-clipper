@@ -501,7 +501,7 @@ def test_catalogue_introspection_helpers():
     assert canonical_provider("11labs") == "elevenlabs"
     assert canonical_provider(None) == "auto"
     assert canonical_provider("weird") == "weird"
-    assert set(KNOWN_PROVIDERS) == {"edge", "elevenlabs", "offline"}
+    assert set(KNOWN_PROVIDERS) == {"edge", "elevenlabs", "piper", "offline"}
     assert find_voice_entry("narrator_deep").supports("edge")
     assert not find_voice_entry("newsroom").supports("elevenlabs")
 
@@ -691,7 +691,7 @@ def test_get_provider_rejects_unknown_names():
         get_provider("festival", settings=_online_settings())
     assert "festival" in str(excinfo.value)
     assert "offline" in str(excinfo.value)
-    assert set(PROVIDER_ALIASES.values()) == {"auto", "edge", "elevenlabs", "offline"}
+    assert set(PROVIDER_ALIASES.values()) == {"auto", "edge", "elevenlabs", "piper", "offline"}
 
 
 def test_get_provider_accepts_every_catalogue_provider_spelling():

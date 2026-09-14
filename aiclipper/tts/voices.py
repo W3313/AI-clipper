@@ -53,6 +53,10 @@ PROVIDER_ALIASES: dict[str, str] = {
     "eleven-labs": "elevenlabs",
     "11labs": "elevenlabs",
     "xi": "elevenlabs",
+    "piper": "piper",
+    "piper-tts": "piper",
+    "local": "piper",
+    "onnx": "piper",
     "offline": "offline",
     "silence": "offline",
     "null": "offline",
@@ -63,7 +67,7 @@ PROVIDER_ALIASES: dict[str, str] = {
 }
 
 #: Backends a catalogue entry may carry an id for.
-KNOWN_PROVIDERS: tuple[str, ...] = ("edge", "elevenlabs", "offline")
+KNOWN_PROVIDERS: tuple[str, ...] = ("edge", "elevenlabs", "piper", "offline")
 
 
 def canonical_provider(name: str | None) -> str:
@@ -81,6 +85,7 @@ class Voice:
     tags: tuple[str, ...] = ()
     edge: str | None = None
     elevenlabs: str | None = None
+    piper: str | None = None
     language: str = "en"
     style: str | None = None
 
@@ -95,6 +100,8 @@ class Voice:
             out["edge"] = self.edge
         if self.elevenlabs:
             out["elevenlabs"] = self.elevenlabs
+        if self.piper:
+            out["piper"] = self.piper
         return out
 
     def provider_id(self, provider: str | None) -> str | None:
@@ -142,6 +149,7 @@ def _v(
     *,
     edge: str | None = None,
     elevenlabs: str | None = None,
+    piper: str | None = None,
     language: str = "en",
     style: str | None = None,
 ) -> Voice:
@@ -151,52 +159,58 @@ def _v(
         tags=tuple(t for t in tags.split() if t),
         edge=edge,
         elevenlabs=elevenlabs,
+        piper=piper,
         language=language,
         style=style,
     )
 
 
 #: The catalogue.  Names are ours; ``edge`` ids are Microsoft neural voice
-#: names and ``elevenlabs`` ids are the public sample voice ids where one is
-#: known (``None`` means "this backend has no mapping -- pick another").
+#: names, ``elevenlabs`` ids are the public sample voice ids and ``piper`` ids
+#: are downloadable model names (``<lang>-<speaker>-<quality>``), each given
+#: where one is known (``None`` means "this backend has no mapping -- pick
+#: another").  Piper's English catalogue is en_US and en_GB only and has no
+#: style control, so every other accent -- and the child, ASMR and hype-promo
+#: entries -- is left ``None`` rather than pointed at a voice that is not that
+#: voice: ``list_voices("piper")`` must list what it can really speak.
 VOICES: tuple[Voice, ...] = (
     # -- American -------------------------------------------------------- #
     _v("narrator_deep", "Low, unhurried male narration for documentary voice-over.",
        "male american deep calm narration documentary audiobook",
-       edge="en-US-GuyNeural", elevenlabs="pNInz6obpgDQGcFmaJgB"),
+       edge="en-US-GuyNeural", elevenlabs="pNInz6obpgDQGcFmaJgB", piper="en_US-ryan-high"),
     _v("narrator_warm", "Warm, even male read that sits under music without fighting it.",
        "male american warm calm narration podcast audiobook",
-       edge="en-US-ChristopherNeural", elevenlabs="ErXwobaYiN019PkySvjV"),
+       edge="en-US-ChristopherNeural", elevenlabs="ErXwobaYiN019PkySvjV", piper="en_US-joe-medium"),
     _v("narrator_female", "Measured female narration with a steady, trustworthy centre.",
        "female american warm calm narration audiobook documentary",
-       edge="en-US-JennyNeural", elevenlabs="21m00Tcm4TlvDq8ikWAM"),
+       edge="en-US-JennyNeural", elevenlabs="21m00Tcm4TlvDq8ikWAM", piper="en_US-lessac-medium"),
     _v("bright_female", "Bright, upbeat female delivery built for fast social hooks.",
        "female american bright energetic promo ads storytelling",
-       edge="en-US-AriaNeural", elevenlabs="EXAVITQu4vr4xnSDxMaL"),
+       edge="en-US-AriaNeural", elevenlabs="EXAVITQu4vr4xnSDxMaL", piper="en_US-amy-medium"),
     _v("bright_male", "Clean, energetic male read with plenty of forward lean.",
        "male american bright energetic promo ads tutorial",
-       edge="en-US-AndrewNeural", elevenlabs="TxGEqnHWrfWFTfGW9XjX"),
+       edge="en-US-AndrewNeural", elevenlabs="TxGEqnHWrfWFTfGW9XjX", piper="en_US-ryan-medium"),
     _v("documentary", "Serious, spacious delivery for archive-footage storytelling.",
        "male american deep serious documentary narration",
-       edge="en-US-RogerNeural", elevenlabs="VR6AewLTigWG4xSOukaG"),
+       edge="en-US-RogerNeural", elevenlabs="VR6AewLTigWG4xSOukaG", piper="en_US-norman-medium"),
     _v("newsroom", "Crisp anchor cadence: clear consonants, no ornament.",
        "male american crisp serious news commentary",
-       edge="en-US-EricNeural"),
+       edge="en-US-EricNeural", piper="en_US-john-medium"),
     _v("newsroom_female", "Studio-desk female read with tight, confident phrasing.",
        "female american crisp serious news commentary",
-       edge="en-US-MichelleNeural", elevenlabs="AZnzlk1XvdvUeBnXmlld"),
+       edge="en-US-MichelleNeural", elevenlabs="AZnzlk1XvdvUeBnXmlld", piper="en_US-hfc_female-medium"),
     _v("storyteller", "Conversational female voice that leans into a plot twist.",
        "female american warm playful storytelling narration",
-       edge="en-US-AvaNeural", elevenlabs="MF3mGyEYCl7XYWbV9V6O"),
+       edge="en-US-AvaNeural", elevenlabs="MF3mGyEYCl7XYWbV9V6O", piper="en_US-ljspeech-high"),
     _v("storyteller_male", "Easy, fireside male storytelling with a dry edge.",
        "male american warm playful storytelling narration",
-       edge="en-US-BrianNeural"),
+       edge="en-US-BrianNeural", piper="en_US-bryce-medium"),
     _v("explainer", "Patient tutorial voice that lands each step cleanly.",
        "male american crisp calm tutorial narration",
-       edge="en-US-SteffanNeural"),
+       edge="en-US-SteffanNeural", piper="en_US-hfc_male-medium"),
     _v("explainer_female", "Friendly how-to female read, teacherly but never slow.",
        "female american warm crisp tutorial narration",
-       edge="en-US-EmmaNeural"),
+       edge="en-US-EmmaNeural", piper="en_US-lessac-high"),
     _v("hype_promo", "High-energy trailer read for a hard-sell opening line.",
        "male american energetic bright promo ads",
        edge="en-US-AndrewMultilingualNeural"),
@@ -211,7 +225,7 @@ VOICES: tuple[Voice, ...] = (
        edge="en-US-BrianMultilingualNeural"),
     _v("podcast_host", "Relaxed two-mic podcast energy with natural pauses.",
        "female american warm playful podcast commentary",
-       edge="en-US-AvaMultilingualNeural"),
+       edge="en-US-AvaMultilingualNeural", piper="en_US-kathleen-low"),
     _v("gaming_commentary", "Fast, reactive commentary voice for gameplay clips.",
        "male american energetic playful gaming commentary",
        edge="en-US-GuyNeural", elevenlabs="yoZ06aMxZJJ28mfd3POQ"),
@@ -219,19 +233,19 @@ VOICES: tuple[Voice, ...] = (
     # -- British --------------------------------------------------------- #
     _v("british_male", "Neutral RP male read: composed, articulate, unhurried.",
        "male british calm crisp narration documentary",
-       edge="en-GB-RyanNeural"),
+       edge="en-GB-RyanNeural", piper="en_GB-alan-medium"),
     _v("british_female", "Neutral RP female read with a light, precise touch.",
        "female british calm crisp narration audiobook",
-       edge="en-GB-SoniaNeural"),
+       edge="en-GB-SoniaNeural", piper="en_GB-cori-high"),
     _v("british_warm", "Softer British female voice, good for personal stories.",
        "female british warm soft storytelling audiobook",
-       edge="en-GB-LibbyNeural"),
+       edge="en-GB-LibbyNeural", piper="en_GB-jenny_dioco-medium"),
     _v("british_gravitas", "Weighty British male delivery for history and mystery.",
        "male british deep serious documentary narration",
-       edge="en-GB-ThomasNeural"),
+       edge="en-GB-ThomasNeural", piper="en_GB-northern_english_male-medium"),
     _v("british_young", "Youthful British voice for first-person confession stories.",
        "female british bright playful storytelling kids",
-       edge="en-GB-MaisieNeural"),
+       edge="en-GB-MaisieNeural", piper="en_GB-southern_english_female-low"),
 
     # -- Irish / Scottish-adjacent --------------------------------------- #
     _v("irish_male", "Irish male read with a lilt that keeps long copy alive.",
@@ -320,10 +334,10 @@ VOICES: tuple[Voice, ...] = (
     # -- Character / utility ---------------------------------------------- #
     _v("chat_incoming", "Neutral voice for the other side of a text conversation.",
        "neutral american calm crisp chat storytelling",
-       edge="en-US-EricNeural"),
+       edge="en-US-EricNeural", piper="en_US-ryan-medium"),
     _v("chat_outgoing", "Neutral voice for the viewer's own side of a chat.",
        "neutral american warm crisp chat storytelling",
-       edge="en-US-JennyNeural"),
+       edge="en-US-JennyNeural", piper="en_US-amy-medium"),
     _v("silent", "No speech at all: timed silence with synthetic word timings.",
        "neutral utility offline silence narration"),
 )

@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 
+from aiclipper import cli
 from aiclipper import ffmpeg as ff
 from aiclipper.cli import build_parser, environment_for, main
 from aiclipper.config import get_settings
@@ -1152,3 +1153,78 @@ def test_the_whisper_weight_probe_never_needs_a_network(
     assert _whisper_weights_cached(str(tmp_path)) is True
     # a name that is not on this disk is reported as missing, not as an error
     assert _whisper_weights_cached("aiclipper-no-such-model-9f3a") is False
+
+
+# --------------------------------------------------------------------------- #
+# doctor: the llm row asks the stronger question
+# --------------------------------------------------------------------------- #
+
+class _FakeLLM:
+    """A backend exposing the optional ``usable()`` probe, like the local one."""
+
+    name = "local"
+    model = "llama3.1"
+    chat_url = "http://localhost:11434/v1/chat/completions"
+
+    def __init__(self, *, available: bool = True, usable: object = True) -> None:
+        self._available = available
+        self._usable = usable
+
+    def available(self) -> bool:
+        return self._available
+
+    def usable(self) -> bool:
+        if isinstance(self._usable, Exception):
+            raise self._usable
+        return bool(self._usable)
+
+
+def _llm_row(monkeypatch: pytest.MonkeyPatch, provider: object) -> tuple[bool, str]:
+    from aiclipper import llm
+
+    monkeypatch.setattr(llm, "get_provider", lambda **kw: provider)
+    return cli._llm_report(get_settings())
+
+
+def test_doctor_llm_row_reports_a_reachable_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    ok, detail = _llm_row(monkeypatch, _FakeLLM(usable=True))
+    assert ok is True
+    assert "llama3.1" in detail
+
+
+def test_doctor_llm_row_reports_a_configured_but_dead_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Configured is not serving -- an OK here becomes a failed render later."""
+    ok, detail = _llm_row(monkeypatch, _FakeLLM(usable=False))
+    assert ok is False
+    assert "nothing is answering" in detail
+    assert "localhost:11434" in detail
+
+
+def test_doctor_llm_row_survives_a_probe_that_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """doctor reports; it never crashes, whatever the backend does."""
+    ok, detail = _llm_row(monkeypatch, _FakeLLM(usable=ConnectionRefusedError("refused")))
+    assert ok is False
+    assert "nothing is answering" in detail
+
+
+def test_doctor_llm_row_skips_the_probe_when_not_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    ok, detail = _llm_row(monkeypatch, _FakeLLM(available=False, usable=True))
+    assert ok is False
+    assert "not configured" in detail
+
+
+def test_doctor_llm_row_falls_back_for_a_backend_without_a_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Claude and the heuristic backend expose no usable(); available() stands in."""
+
+    class _NoProbe:
+        name = "heuristic"
+
+        def available(self) -> bool:
+            return True
+
+    ok, _ = _llm_row(monkeypatch, _NoProbe())
+    assert ok is True
+
+
+def test_doctor_lists_piper_among_the_speech_backends() -> None:
+    assert "piper" in cli._TTS_BACKENDS

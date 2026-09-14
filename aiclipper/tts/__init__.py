@@ -11,9 +11,16 @@ Ask :func:`get_provider` for a backend and program against
 ``"auto"`` picks :class:`~aiclipper.tts.edge.EdgeTTS` when ``edge_tts`` is
 installed and ``settings.offline`` is false, then
 :class:`~aiclipper.tts.eleven.ElevenLabsTTS` when ``ELEVENLABS_API_KEY`` is set,
-and finally :class:`~aiclipper.tts.offline.OfflineTTS` -- which renders timed
-silence with synthetic word timings and is what keeps every workflow runnable
-with no key and no egress.
+then :class:`~aiclipper.tts.piper.PiperTTS` when a local Piper install and voice
+model are present, and finally :class:`~aiclipper.tts.offline.OfflineTTS` --
+which renders timed silence with synthetic word timings and is what keeps every
+workflow runnable with no key and no egress.
+
+Piper is the one real voice that needs neither a key nor a network, so it sits
+ahead of silence in both ``"auto"`` and the runtime fallback chain: a machine
+whose only speech backend is local should narrate, not go quiet.  It returns no
+word boundaries, which costs nothing here -- ``narration_words`` force-aligns
+the audio instead.
 
 :func:`~aiclipper.tts.base.synthesize_lines` is the one function most callers
 need: it writes one file per line and rebases every word timing onto a single
@@ -58,13 +65,14 @@ from .base import (
 from .edge import EdgeTTS
 from .eleven import ElevenLabsTTS
 from .offline import WORDS_PER_SECOND, OfflineTTS, estimate_duration, plan_words
+from .piper import PiperTTS
 from .voices import VOICES, Voice, find_voice, find_voice_entry, list_voices, resolve_voice_id
 
 __all__ = [
     "TTSProvider", "get_provider", "synthesize_lines", "total_duration", "PROVIDER_ALIASES",
     "NarrationResults", "fallback_chain", "FALLBACK_ORDER",
     "provider_usable", "reset_usable_cache", "USABLE_TIMEOUT",
-    "EdgeTTS", "ElevenLabsTTS", "OfflineTTS",
+    "EdgeTTS", "ElevenLabsTTS", "PiperTTS", "OfflineTTS",
     "WORDS_PER_SECOND", "estimate_duration", "plan_words",
     "Voice", "VOICES", "find_voice", "find_voice_entry", "list_voices", "resolve_voice_id",
 ]
